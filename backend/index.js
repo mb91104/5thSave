@@ -58,7 +58,119 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
+// --- Cart Routes ---
+app.post('/cart', authenticateToken, async (req, res) => {
+  const { productId, quantity = 1 } = req.body;
+  try {
+    const result = await db.query(
+      'INSERT INTO cart_items (user_id, product_id, quantity) VALUES ($1, $2, $3) RETURNING *',
+      [req.user.id, productId, quantity]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get('/cart', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query(
+      'SELECT ci.*, p.name, p.price FROM cart_items ci JOIN products p ON ci.product_id = p.id WHERE ci.user_id = $1',
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/cart/:id', authenticateToken, async (req, res) => {
+  try {
+    await db.query('DELETE FROM cart_items WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+    res.json({ message: 'Item removed from cart' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/shop/checkout', authenticateToken, async (req, res) => {
+  const { goalId } = req.body;
+  if (!goalId) return res.status(400).json({ error: 'Goal ID is required for checkout' });
+
+  try {
+    // 1. Get cart items
+    const cartRes = await db.query(
+      'SELECT ci.id, ci.product_id, ci.quantity, p.price, p.name FROM cart_items ci JOIN products p ON ci.product_id = p.id WHERE ci.user_id = $1',
+      [req.user.id]
+    );
+    const items = cartRes.rows;
+    if (items.length === 0) return res.status(400).json({ error: 'Cart is empty' });
+
+    let totalOrderAmount = 0;
+    for (const item of items) {
+      totalOrderAmount += item.price * item.quantity;
+    }
+
+    // 2. Create Order
+    const orderRes = await db.query(
+      'INSERT INTO orders (user_id, goal_id, total_amount) VALUES ($1, $2, $3) RETURNING id',
+      [req.user.id, goalId, totalOrderAmount]
+    );
+    const orderId = orderRes.rows[0].id;
+
+    // 3. Move items to order_items and add to transaction_ledger
+    for (const item of items) {
+      await db.query(
+        'INSERT INTO order_items (order_id, product_id, price_at_purchase, quantity) VALUES ($1, $2, $3, $4)',
+        [orderId, item.product_id, item.price, item.quantity]
+      );
+
+      await db.query(
+        'INSERT INTO transaction_ledger (goal_id, amount, transaction_type, description) VALUES ($1, $2, $3, $4)',
+        [goalId, -(item.price * item.quantity), 'spend', `Bought ${item.name} x${item.quantity}`]
+      );
+    }
+
+    // 4. Clear Cart
+    await db.query('DELETE FROM cart_items WHERE user_id = $1', [req.user.id]);
+
+    // 5. AUTOMATIC TIME SKIP (per requirement 3)
+    // We increment start_date by 1 day per checkout as a progression marker
+    await db.query(
+      "UPDATE savings_goals SET start_date = start_date + (1 || ' days')::interval WHERE id = $1",
+      [goalId]
+    );
+
+    // 6. Award rewards
+    await checkAndAwardRewards(req.user.id, goalId);
+
+    res.status(201).json({ 
+      message: 'Checkout successful!', 
+      orderId, 
+      totalAmount: totalOrderAmount,
+      receipt: items 
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/goals/:id/end', authenticateToken, async (req, res) => {
+  const goalId = req.params.id;
+  try {
+    const goalCheck = await db.query('SELECT id FROM savings_goals WHERE id = $1 AND user_id = $2', [goalId, req.user.id]);
+    if (goalCheck.rows.length === 0) return res.status(403).json({ error: 'Unauthorized' });
+
+    await db.query("UPDATE savings_goals SET status = 'completed' WHERE id = $1", [goalId]);
+    res.json({ message: 'Goal ended successfully!' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // --- Goal Routes ---
+
 
 async function checkAndAwardRewards(userId, goalId) {
   try {
@@ -67,10 +179,9 @@ async function checkAndAwardRewards(userId, goalId) {
     const limit = parseFloat(goalRes.rows[0].amount_limit);
 
     const spendingRes = await db.query('SELECT SUM(amount) as total FROM transaction_ledger WHERE goal_id = $1', [goalId]);
-    const totalSpending = parseFloat(spendingRes.rows[0].total || 0);
+    const totalBalance = parseFloat(spendingRes.rows[0].total || 0);
     
-    const saved = limit + totalSpending; 
-    const percentage = (saved / limit) * 100;
+    const percentage = (totalBalance / limit) * 100;
 
     const rewardMap = {
       25: 'Flipkart Voucher',
@@ -121,6 +232,15 @@ app.get('/goals', authenticateToken, async (req, res) => {
   }
 });
 
+app.delete('/goals', authenticateToken, async (req, res) => {
+  try {
+    await db.query('DELETE FROM savings_goals WHERE user_id = $1', [req.user.id]);
+    res.json({ message: 'All goals cleared successfully!' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/products', async (req, res) => {
   try {
     const result = await db.query('SELECT * FROM products');
@@ -166,8 +286,8 @@ app.post('/goals/:id/skip-time', authenticateToken, async (req, res) => {
     if (goalCheck.rows.length === 0) return res.status(403).json({ error: 'Unauthorized' });
 
     await db.query(
-      "UPDATE savings_goals SET start_date = start_date + interval '$days days' WHERE id = $1",
-      [goalId]
+      "UPDATE savings_goals SET start_date = start_date + ($1 || ' days')::interval WHERE id = $2",
+      [days, goalId]
     );
 
     await checkAndAwardRewards(req.user.id, goalId);

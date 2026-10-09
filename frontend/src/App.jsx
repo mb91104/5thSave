@@ -1,5 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
+import { 
+  PieChart, Pie, Cell, ResponsiveContainer, 
+  Tooltip, Legend, BarChart, Bar, XAxis, YAxis 
+} from 'recharts';
 
 const API_BASE = 'http://localhost:3000';
 
@@ -17,6 +21,8 @@ function App() {
   const [circleForm, setCircleForm] = useState({ circle_name: '', invite_token: '' });
   const [activeGoalId, setActiveGoalId] = useState(null);
   const [currentPage, setCurrentPage] = useState('dashboard'); // dashboard, shop, social
+  const [cart, setCart] = useState([]);
+  const [receipt, setReceipt] = useState(null);
 
   useEffect(() => {
     if (token) {
@@ -24,6 +30,7 @@ function App() {
       fetchRewards();
       fetchProducts();
       fetchCircles();
+      fetchCart();
     }
   }, [token]);
 
@@ -71,11 +78,27 @@ function App() {
     } catch (err) { console.error(err); }
   };
 
+  const fetchCart = async () => {
+    try {
+      const res = await axios.get(`${API_BASE}/cart`, { headers: { Authorization: `Bearer ${token}` } });
+      setCart(res.data);
+    } catch (err) { console.error(err); }
+  };
+
   const fetchLeaderboard = async (circleId) => {
     try {
       const res = await axios.get(`${API_BASE}/leaderboard/${circleId}`, { headers: { Authorization: `Bearer ${token}` } });
       setLeaderboard(res.data);
     } catch (err) { console.error(err); }
+  };
+
+  const resetGoals = async () => {
+    if (!window.confirm('Are you sure you want to clear all your goals?')) return;
+    try {
+      await axios.delete(`${API_BASE}/goals`, { headers: { Authorization: `Bearer ${token}` } });
+      fetchGoals();
+      alert('Goals reset!');
+    } catch (err) { alert(err.response?.data?.error || 'Error resetting goals'); }
   };
 
   const createGoal = async (e) => {
@@ -86,22 +109,39 @@ function App() {
     } catch (err) { alert(err.response?.data?.error || 'Error'); }
   };
 
-  const skipTime = async (goalId, interval) => {
+  const endGoal = async (goalId) => {
     try {
-      await axios.post(`${API_BASE}/goals/${goalId}/skip-time`, { interval }, { headers: { Authorization: `Bearer ${token}` } });
-      alert(`${interval} skipped!`);
+      await axios.post(`${API_BASE}/goals/${goalId}/end`, { }, { headers: { Authorization: `Bearer ${token}` } });
+      alert('Goal ended!');
       fetchGoals();
-      fetchRewards();
     } catch (err) { alert(err.response?.data?.error || 'Error'); }
   };
 
-  const buyProduct = async (productId, goalId) => {
+  const addToCart = async (productId) => {
     try {
-      await axios.post(`${API_BASE}/shop/buy`, { productId, goalId }, { headers: { Authorization: `Bearer ${token}` } });
-      alert('Purchase successful!');
+      await axios.post(`${API_BASE}/cart`, { productId, quantity: 1 }, { headers: { Authorization: `Bearer ${token}` } });
+      fetchCart();
+      alert('Added to cart!');
+    } catch (err) { alert(err.response?.data?.error || 'Error'); }
+  };
+
+  const removeFromCart = async (itemId) => {
+    try {
+      await axios.delete(`${API_BASE}/cart/${itemId}`, { headers: { Authorization: `Bearer ${token}` } });
+      fetchCart();
+    } catch (err) { alert(err.response?.data?.error || 'Error'); }
+  };
+
+  const checkout = async () => {
+    if (!activeGoalId) return alert('Please select a goal for this session');
+    try {
+      const res = await axios.post(`${API_BASE}/shop/checkout`, { goalId: activeGoalId }, { headers: { Authorization: `Bearer ${token}` } });
+      setReceipt(res.data);
+      setCart([]);
       fetchGoals();
       fetchRewards();
-    } catch (err) { alert(err.response?.data?.error || 'Purchase failed'); }
+      alert('Checkout successful! Time has progressed.');
+    } catch (err) { alert(err.response?.data?.error || 'Checkout failed'); }
   };
 
   const createCircle = async (e) => {
@@ -167,16 +207,16 @@ function App() {
               <button type="submit">Create Goal</button>
             </form>
             <div style={{ marginTop: '20px' }}>
-              <h4>Your Active Goals</h4>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+                <h4 style={{ margin: 0 }}>Your Active Goals</h4>
+                <button onClick={resetGoals} style={{ fontSize: '11px', padding: '2px 5px', color: 'red', cursor: 'pointer' }}>Reset All</button>
+              </div>
               <ul style={{ listStyle: 'none', padding: 0 }}>
                 {goals.map(g => (
                   <li key={g.id} style={{ padding: '10px', borderBottom: '1px solid #eee', display: 'flex', flexDirection: 'column', gap: '10px' }}>
                     <span><strong>Goal #{g.id}</strong>: Limit ₹{g.amount_limit} | Status: {g.status}</span>
                     {g.status === 'active' && (
-                      <div style={{ display: 'flex', gap: '5px' }}>
-                        <button onClick={() => skipTime(g.id, 'week')} style={{ fontSize: '12px' }}>Skip Week</button>
-                        <button onClick={() => skipTime(g.id, 'month')} style={{ fontSize: '12px' }}>Skip Month</button>
-                      </div>
+                      <button onClick={() => endGoal(g.id)} style={{ fontSize: '12px', alignSelf: 'flex-start' }}>End Goal</button>
                     )}
                   </li>
                 ))}
@@ -186,44 +226,120 @@ function App() {
           </section>
 
           <section style={{ padding: '15px', border: '1px solid #ddd', borderRadius: '8px' }}>
-            <h3>🎁 Rewards Earned</h3>
-            <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-              {rewards.map(r => (
-                <div key={r.id} style={{ padding: '10px', background: '#f0fff0', border: '1px solid #4caf50', borderRadius: '5px' }}>
-                  <strong>{r.checkpoint_percentage}%!</strong><br/>{r.reward_item}
-                </div>
-              ))}
-              {rewards.length === 0 && <p>No rewards yet.</p>}
+            <h3>📊 Budget Progress</h3>
+            {goals.length > 0 ? (
+              <div style={{ height: '300px' }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <PieChart>
+                    <Pie 
+                      data={[
+                        { name: 'Spent', value: goals[0].amount_limit || 0 }, // Simplified for the first goal
+                        { name: 'Remaining', value: Math.max(0, goals[0].amount_limit - (goals[0].amount_limit || 0)) }
+                      ]} 
+                      cx="50%" cy="50%" 
+                      outerRadius={80} 
+                      fill="#8884d8" 
+                      dataKey="value" 
+                      label
+                    >
+                      <Cell fill="#ff4d4f" />
+                      <Cell fill="#52c41a" />
+                    </Pie>
+                    <Tooltip />
+                    <Legend />
+                  </PieChart>
+                </ResponsiveContainer>
+              </div>
+            ) : <p>No goals set to visualize.</p>}
+            <div style={{ marginTop: '20px' }}>
+               <h4 style={{ margin: 0 }}>🎁 Rewards Earned</h4>
+               <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', marginTop: '10px' }}>
+                {rewards.map(r => (
+                  <div key={r.id} style={{ padding: '10px', background: '#f0fff0', border: '1px solid #4caf50', borderRadius: '5px' }}>
+                    <strong>{r.checkpoint_percentage}%!</strong><br/>{r.reward_item}
+                  </div>
+                ))}
+                {rewards.length === 0 && <p>No rewards yet.</p>}
+               </div>
             </div>
           </section>
         </div>
       )}
 
       {currentPage === 'shop' && (
-        <div style={{ padding: '15px', border: '1px solid #ddd', borderRadius: '8px' }}>
-          <h3>🛒 Shopping Simulation</h3>
-          <p>Select a goal to apply the spending to.</p>
-          <select 
-            onChange={e => setActiveGoalId(e.target.value)} 
-            style={{ width: '100%', marginBottom: '20px', padding: '10px' }}
-          >
-            <option value="">-- Select Goal --</option>
-            {goals.map(g => <option key={g.id} value={g.id}>Goal #{g.id} (Limit ₹{g.amount_limit})</option>)}
-          </select>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '15px' }}>
-            {products.map(p => (
-              <div key={p.id} style={{ padding: '15px', border: '1px solid #eee', borderRadius: '8px', textAlign: 'center', background: '#f9f9f9' }}>
-                <strong>{p.name}</strong><br/>
-                ₹{p.price}<br/>
+        <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '20px' }}>
+          <div style={{ padding: '15px', border: '1px solid #ddd', borderRadius: '8px' }}>
+            <h3>🛒 Shopping Simulation</h3>
+            <p>Select a goal to apply the spending to.</p>
+            <select 
+              onChange={e => setActiveGoalId(e.target.value)} 
+              style={{ width: '100%', marginBottom: '20px', padding: '10px' }}
+            >
+              <option value="">-- Select Goal --</option>
+              {goals.map(g => <option key={g.id} value={g.id}>Goal #{g.id} (Limit ₹{g.amount_limit})</option>)}
+            </select>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '15px' }}>
+              {products.map(p => (
+                <div key={p.id} style={{ padding: '15px', border: '1px solid #eee', borderRadius: '8px', textAlign: 'center', background: '#f9f9f9' }}>
+                  <strong>{p.name}</strong><br/>
+                  ₹{p.price}<br/>
+                  <button 
+                    onClick={() => addToCart(p.id)}
+                    style={{ marginTop: '10px', cursor: 'pointer' }}
+                  >
+                    Add to Cart
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div style={{ padding: '15px', border: '1px solid #ddd', borderRadius: '8px', background: '#fafafa' }}>
+            <h3>🛒 Your Cart</h3>
+            {cart.length > 0 ? (
+              <ul style={{ listStyle: 'none', padding: 0 }}>
+                {cart.map(item => (
+                  <li key={item.id} style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '10px', padding: '5px', borderBottom: '1px solid #eee' }}>
+                    <span>{item.name} x{item.quantity} (₹{item.price * item.quantity})</span>
+                    <button onClick={() => removeFromCart(item.id)} style={{ color: 'red', cursor: 'pointer' }}>X</button>
+                  </li>
+                ))}
+                <div style={{ marginTop: '20px', fontWeight: 'bold', textAlign: 'right' }}>
+                  Total: ₹{cart.reduce((sum, item) => sum + (item.price * item.quantity), 0)}
+                </div>
                 <button 
-                  disabled={!activeGoalId} 
-                  onClick={() => buyProduct(p.id, activeGoalId)}
-                  style={{ marginTop: '10px', cursor: 'pointer' }}
+                  onClick={checkout} 
+                  style={{ width: '100%', marginTop: '10px', padding: '10px', background: '#4caf50', color: 'white', border: 'none', borderRadius: '5px', cursor: 'pointer' }}
                 >
-                  Buy
+                  Checkout
+                </button>
+              </ul>
+            ) : <p>Cart is empty.</p>}
+            
+            {receipt && (
+              <div style={{ marginTop: '20px', padding: '10px', background: '#fff', border: '1px dashed #999', borderRadius: '5px' }}>
+                <h4 style={{ margin: '0 0 10px 0', textAlign: 'center' }}>🧾 Receipt</h4>
+                <div style={{ fontSize: '12px' }}>
+                  {receipt.receipt.map((item, i) => (
+                    <div key={i} style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span>{item.name} x{item.quantity}</span>
+                      <span>₹{item.price * item.quantity}</span>
+                    </div>
+                  ))}
+                  <hr/>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 'bold' }}>
+                    <span>Total</span>
+                    <span>₹{receipt.totalAmount}</span>
+                  </div>
+                </div>
+                <button 
+                  onClick={() => setReceipt(null)} 
+                  style={{ width: '100%', marginTop: '10px', fontSize: '11px' }}
+                >
+                  Close Receipt
                 </button>
               </div>
-            ))}
+            )}
           </div>
         </div>
       )}
@@ -244,7 +360,7 @@ function App() {
               <input 
                 placeholder="Enter Invite Token" 
                 value={circleForm.invite_token} 
-                onChange={e => setCircleForm({...circleForm, invite_token: e.target.value})} 
+                onChange={e => setCircleForm({...circleForm, invite_token: ''})} 
               />
               <button type="submit">Join via Invite</button>
             </form>
