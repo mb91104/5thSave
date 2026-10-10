@@ -2,8 +2,13 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const path = require('path');
 const db = require('./db');
-require('dotenv').config();
+// Pin to backend/.env regardless of the working directory the server is started from.
+// (A second .env at the repo root has a different JWT_SECRET — loading that by
+// accident invalidates every issued token.)
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const app = express();
 app.use(cors());
@@ -14,10 +19,10 @@ const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
-  if (!token) return res.sendStatus(401);
+  if (!token) return res.status(401).json({ error: 'Not signed in. Please sign in again.' });
 
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) return res.sendStatus(403);
+    if (err) return res.status(401).json({ error: 'Session expired. Please sign out and sign in again.' });
     req.user = user;
     next();
   });
@@ -27,14 +32,23 @@ const authenticateToken = (req, res, next) => {
 
 app.post('/auth/register', async (req, res) => {
   const { username, email, password } = req.body;
+  if (!username?.trim() || !email?.trim() || !password) {
+    return res.status(400).json({ error: 'Username, email and password are required' });
+  }
+  if (password.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  }
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
     const result = await db.query(
       'INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username',
-      [username, email, hashedPassword]
+      [username.trim(), email.trim(), hashedPassword]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'Username or email is already taken' });
+    }
     res.status(400).json({ error: err.message });
   }
 });
@@ -60,10 +74,22 @@ app.post('/auth/login', async (req, res) => {
 
 // --- Cart Routes ---
 app.post('/cart', authenticateToken, async (req, res) => {
-  const { productId, quantity = 1 } = req.body;
+  const productId = Number(req.body.productId);
+  const quantity = req.body.quantity === undefined ? 1 : Number(req.body.quantity);
+  if (!Number.isInteger(productId) || productId <= 0) {
+    return res.status(400).json({ error: 'Valid productId is required' });
+  }
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > 99) {
+    return res.status(400).json({ error: 'Quantity must be between 1 and 99' });
+  }
   try {
+    const product = await db.query('SELECT id FROM products WHERE id = $1', [productId]);
+    if (product.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
+
     const result = await db.query(
-      'INSERT INTO cart_items (user_id, product_id, quantity) VALUES ($1, $2, $3) RETURNING *',
+      `INSERT INTO cart_items (user_id, product_id, quantity) VALUES ($1, $2, $3)
+       ON CONFLICT (user_id, product_id) DO UPDATE SET quantity = cart_items.quantity + EXCLUDED.quantity
+       RETURNING *`,
       [req.user.id, productId, quantity]
     );
     res.status(201).json(result.rows[0]);
@@ -75,7 +101,9 @@ app.post('/cart', authenticateToken, async (req, res) => {
 app.get('/cart', authenticateToken, async (req, res) => {
   try {
     const result = await db.query(
-      'SELECT ci.*, p.name, p.price FROM cart_items ci JOIN products p ON ci.product_id = p.id WHERE ci.user_id = $1',
+      `SELECT ci.id, ci.quantity, p.id AS product_id, p.name, p.price
+       FROM cart_items ci JOIN products p ON ci.product_id = p.id
+       WHERE ci.user_id = $1 ORDER BY ci.id`,
       [req.user.id]
     );
     res.json(result.rows);
@@ -86,7 +114,11 @@ app.get('/cart', authenticateToken, async (req, res) => {
 
 app.delete('/cart/:id', authenticateToken, async (req, res) => {
   try {
-    await db.query('DELETE FROM cart_items WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+    const result = await db.query(
+      'DELETE FROM cart_items WHERE id = $1 AND user_id = $2 RETURNING id',
+      [req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Cart item not found' });
     res.json({ message: 'Item removed from cart' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -94,25 +126,43 @@ app.delete('/cart/:id', authenticateToken, async (req, res) => {
 });
 
 app.post('/shop/checkout', authenticateToken, async (req, res) => {
-  const { goalId } = req.body;
-  if (!goalId) return res.status(400).json({ error: 'Goal ID is required for checkout' });
+  const goalId = Number(req.body.goalId);
+  if (!Number.isInteger(goalId) || goalId <= 0) {
+    return res.status(400).json({ error: 'Valid goalId is required for checkout' });
+  }
 
+  const client = await db.getClient();
   try {
+    await client.query('BEGIN');
+
+    // Goal must exist and belong to the buyer
+    const goalRes = await client.query(
+      'SELECT id FROM savings_goals WHERE id = $1 AND user_id = $2',
+      [goalId, req.user.id]
+    );
+    if (goalRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Goal not found or not yours' });
+    }
+
     // 1. Get cart items
-    const cartRes = await db.query(
-      'SELECT ci.id, ci.product_id, ci.quantity, p.price, p.name FROM cart_items ci JOIN products p ON ci.product_id = p.id WHERE ci.user_id = $1',
+    const cartRes = await client.query(
+      'SELECT ci.id, ci.product_id, ci.quantity, p.price, p.name FROM cart_items ci JOIN products p ON ci.product_id = p.id WHERE ci.user_id = $1 ORDER BY ci.id',
       [req.user.id]
     );
     const items = cartRes.rows;
-    if (items.length === 0) return res.status(400).json({ error: 'Cart is empty' });
+    if (items.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Cart is empty' });
+    }
 
     let totalOrderAmount = 0;
     for (const item of items) {
-      totalOrderAmount += item.price * item.quantity;
+      totalOrderAmount += Number(item.price) * item.quantity;
     }
 
     // 2. Create Order
-    const orderRes = await db.query(
+    const orderRes = await client.query(
       'INSERT INTO orders (user_id, goal_id, total_amount) VALUES ($1, $2, $3) RETURNING id',
       [req.user.id, goalId, totalOrderAmount]
     );
@@ -120,50 +170,57 @@ app.post('/shop/checkout', authenticateToken, async (req, res) => {
 
     // 3. Move items to order_items and add to transaction_ledger
     for (const item of items) {
-      await db.query(
+      await client.query(
         'INSERT INTO order_items (order_id, product_id, price_at_purchase, quantity) VALUES ($1, $2, $3, $4)',
         [orderId, item.product_id, item.price, item.quantity]
       );
 
-      await db.query(
+      await client.query(
         'INSERT INTO transaction_ledger (goal_id, amount, transaction_type, description) VALUES ($1, $2, $3, $4)',
-        [goalId, -(item.price * item.quantity), 'spend', `Bought ${item.name} x${item.quantity}`]
+        [goalId, -(Number(item.price) * item.quantity), 'spend', `Bought ${item.name} x${item.quantity}`]
       );
     }
 
     // 4. Clear Cart
-    await db.query('DELETE FROM cart_items WHERE user_id = $1', [req.user.id]);
+    await client.query('DELETE FROM cart_items WHERE user_id = $1', [req.user.id]);
 
-    // 5. AUTOMATIC TIME SKIP (per requirement 3)
-    // We increment start_date by 1 day per checkout as a progression marker
-    await db.query(
-      "UPDATE savings_goals SET start_date = start_date + (1 || ' days')::interval WHERE id = $1",
-      [goalId]
+    // 5. AUTOMATIC TIME SKIP: +1 day per checkout as a progression marker
+    await client.query(
+      'UPDATE savings_goals SET start_date = start_date + $1 * INTERVAL \'1 day\' WHERE id = $2',
+      [1, goalId]
     );
 
-    // 6. Award rewards
+    await client.query('COMMIT');
+
+    // 6. Award rewards (read-only; safe outside the transaction)
     await checkAndAwardRewards(req.user.id, goalId);
 
-    res.status(201).json({ 
-      message: 'Checkout successful!', 
-      orderId, 
+    res.status(201).json({
+      message: 'Checkout successful!',
+      orderId,
       totalAmount: totalOrderAmount,
-      receipt: items 
+      receipt: items.map((it) => ({ ...it, price: Number(it.price) })),
     });
   } catch (err) {
+    try { await client.query('ROLLBACK'); } catch { /* already closed */ }
     console.error(err);
     res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
 app.post('/goals/:id/end', authenticateToken, async (req, res) => {
-  const goalId = req.params.id;
+  const goalId = Number(req.params.id);
+  if (!Number.isInteger(goalId) || goalId <= 0) {
+    return res.status(400).json({ error: 'Valid goal id is required' });
+  }
   try {
     const goalCheck = await db.query('SELECT id FROM savings_goals WHERE id = $1 AND user_id = $2', [goalId, req.user.id]);
-    if (goalCheck.rows.length === 0) return res.status(403).json({ error: 'Unauthorized' });
+    if (goalCheck.rows.length === 0) return res.status(403).json({ error: 'Goal not found or not yours' });
 
-    await db.query("UPDATE savings_goals SET status = 'completed' WHERE id = $1", [goalId]);
-    res.json({ message: 'Goal ended successfully!' });
+    const result = await db.query("UPDATE savings_goals SET status = 'completed' WHERE id = $1 RETURNING *", [goalId]);
+    res.json({ message: 'Goal ended successfully!', goal: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -177,11 +234,12 @@ async function checkAndAwardRewards(userId, goalId) {
     const goalRes = await db.query('SELECT amount_limit FROM savings_goals WHERE id = $1', [goalId]);
     if (goalRes.rows.length === 0) return;
     const limit = parseFloat(goalRes.rows[0].amount_limit);
+    if (!limit || limit <= 0) return;
 
     const spendingRes = await db.query('SELECT SUM(amount) as total FROM transaction_ledger WHERE goal_id = $1', [goalId]);
-    const totalBalance = parseFloat(spendingRes.rows[0].total || 0);
+    const totalSpent = Math.abs(parseFloat(spendingRes.rows[0].total || 0));
     
-    const percentage = (totalBalance / limit) * 100;
+    const percentage = (totalSpent / limit) * 100;
 
     const rewardMap = {
       25: 'Flipkart Voucher',
@@ -212,12 +270,24 @@ async function checkAndAwardRewards(userId, goalId) {
 
 app.post('/goals', authenticateToken, async (req, res) => {
   const { amount_limit, start_date, end_date } = req.body;
+  const amount = Number(amount_limit);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ error: 'amount_limit must be a number greater than 0' });
+  }
+  const start = new Date(start_date);
+  const end = new Date(end_date);
+  if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+    return res.status(400).json({ error: 'start_date and end_date must be valid dates' });
+  }
+  if (start >= end) {
+    return res.status(400).json({ error: 'start_date must be before end_date' });
+  }
   try {
     const result = await db.query(
       'INSERT INTO savings_goals (user_id, amount_limit, start_date, end_date) VALUES ($1, $2, $3, $4) RETURNING *',
-      [req.user.id, amount_limit, start_date, end_date]
+      [req.user.id, amount, start.toISOString(), end.toISOString()]
     );
-    res.status(201).json(result.rows[0]);
+    res.status(201).json({ ...result.rows[0], total_spent: 0, tx_count: 0 });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -225,7 +295,17 @@ app.post('/goals', authenticateToken, async (req, res) => {
 
 app.get('/goals', authenticateToken, async (req, res) => {
   try {
-    const result = await db.query('SELECT * FROM savings_goals WHERE user_id = $1', [req.user.id]);
+    const result = await db.query(
+      `SELECT sg.*,
+              COALESCE(SUM(CASE WHEN tl.amount < 0 THEN -tl.amount ELSE 0 END), 0)::float AS total_spent,
+              COUNT(tl.id)::int AS tx_count
+       FROM savings_goals sg
+       LEFT JOIN transaction_ledger tl ON tl.goal_id = sg.id
+       WHERE sg.user_id = $1
+       GROUP BY sg.id
+       ORDER BY sg.id`,
+      [req.user.id]
+    );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -243,7 +323,26 @@ app.delete('/goals', authenticateToken, async (req, res) => {
 
 app.get('/products', async (req, res) => {
   try {
-    const result = await db.query('SELECT * FROM products');
+    const category = req.query.category?.trim();
+    if (category) {
+      const result = await db.query(
+        'SELECT * FROM products WHERE category = $1 ORDER BY id',
+        [category]
+      );
+      return res.json(result.rows);
+    }
+    const result = await db.query('SELECT * FROM products ORDER BY id');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/products/categories', async (req, res) => {
+  try {
+    const result = await db.query(
+      'SELECT category, COUNT(*)::int AS count FROM products GROUP BY category ORDER BY category'
+    );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -251,8 +350,18 @@ app.get('/products', async (req, res) => {
 });
 
 app.post('/shop/buy', authenticateToken, async (req, res) => {
-  const { productId, goalId } = req.body;
+  const productId = Number(req.body.productId);
+  const goalId = Number(req.body.goalId);
+  if (!Number.isInteger(productId) || productId <= 0) {
+    return res.status(400).json({ error: 'Valid productId is required' });
+  }
+  if (!Number.isInteger(goalId) || goalId <= 0) {
+    return res.status(400).json({ error: 'Valid goalId is required' });
+  }
   try {
+    const goalCheck = await db.query('SELECT id FROM savings_goals WHERE id = $1 AND user_id = $2', [goalId, req.user.id]);
+    if (goalCheck.rows.length === 0) return res.status(403).json({ error: 'Goal not found or not yours' });
+
     const productRes = await db.query('SELECT price, name FROM products WHERE id = $1', [productId]);
     if (productRes.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
     
@@ -273,9 +382,12 @@ app.post('/shop/buy', authenticateToken, async (req, res) => {
 });
 
 app.post('/goals/:id/skip-time', authenticateToken, async (req, res) => {
-  const goalId = req.params.id;
-  const { interval } = req.body; 
-  
+  const goalId = Number(req.params.id);
+  if (!Number.isInteger(goalId) || goalId <= 0) {
+    return res.status(400).json({ error: 'Valid goal id is required' });
+  }
+  const { interval } = req.body;
+
   let days = 0;
   if (interval === 'week') days = 7;
   else if (interval === 'month') days = 30;
@@ -283,10 +395,10 @@ app.post('/goals/:id/skip-time', authenticateToken, async (req, res) => {
 
   try {
     const goalCheck = await db.query('SELECT id, start_date FROM savings_goals WHERE id = $1 AND user_id = $2', [goalId, req.user.id]);
-    if (goalCheck.rows.length === 0) return res.status(403).json({ error: 'Unauthorized' });
+    if (goalCheck.rows.length === 0) return res.status(403).json({ error: 'Goal not found or not yours' });
 
     await db.query(
-      "UPDATE savings_goals SET start_date = start_date + ($1 || ' days')::interval WHERE id = $2",
+      'UPDATE savings_goals SET start_date = start_date + $1 * INTERVAL \'1 day\' WHERE id = $2',
       [days, goalId]
     );
 
@@ -301,12 +413,25 @@ app.post('/goals/:id/skip-time', authenticateToken, async (req, res) => {
 
 app.post('/transactions', authenticateToken, async (req, res) => {
   const { goal_id, amount, transaction_type, description } = req.body;
+  const goalId = Number(goal_id);
+  const value = Number(amount);
+  if (!Number.isInteger(goalId) || goalId <= 0) {
+    return res.status(400).json({ error: 'Valid goal_id is required' });
+  }
+  if (!Number.isFinite(value)) {
+    return res.status(400).json({ error: 'Valid amount is required' });
+  }
+  if (!['spend', 'refund', 'adjustment'].includes(transaction_type)) {
+    return res.status(400).json({ error: 'transaction_type must be spend, refund or adjustment' });
+  }
   try {
+    const goalCheck = await db.query('SELECT id FROM savings_goals WHERE id = $1 AND user_id = $2', [goalId, req.user.id]);
+    if (goalCheck.rows.length === 0) return res.status(403).json({ error: 'Goal not found or not yours' });
     const result = await db.query(
       'INSERT INTO transaction_ledger (goal_id, amount, transaction_type, description) VALUES ($1, $2, $3, $4) RETURNING *',
-      [goal_id, amount, transaction_type, description]
+      [goalId, value, transaction_type, description || null]
     );
-    await checkAndAwardRewards(req.user.id, goal_id);
+    await checkAndAwardRewards(req.user.id, goalId);
     res.status(201).json(result.rows[0]);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -315,7 +440,7 @@ app.post('/transactions', authenticateToken, async (req, res) => {
 
 app.get('/rewards', authenticateToken, async (req, res) => {
   try {
-    const result = await db.query('SELECT * FROM rewards WHERE user_id = $1', [req.user.id]);
+    const result = await db.query('SELECT * FROM rewards WHERE user_id = $1 ORDER BY earned_at', [req.user.id]);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -327,7 +452,10 @@ app.get('/rewards', authenticateToken, async (req, res) => {
 app.get('/circles', authenticateToken, async (req, res) => {
   try {
     const result = await db.query(
-      'SELECT pc.* FROM peer_circles pc JOIN circle_members cm ON pc.id = cm.circle_id WHERE cm.user_id = $1',
+      `SELECT pc.id, pc.circle_name, pc.created_at, pc.created_by,
+              (pc.created_by = $1) AS is_creator,
+              (SELECT COUNT(*)::int FROM circle_members cm2 WHERE cm2.circle_id = pc.id) AS member_count
+       FROM peer_circles pc JOIN circle_members cm ON pc.id = cm.circle_id WHERE cm.user_id = $1 ORDER BY pc.id`,
       [req.user.id]
     );
     res.json(result.rows);
@@ -337,11 +465,17 @@ app.get('/circles', authenticateToken, async (req, res) => {
 });
 
 app.post('/circles', authenticateToken, async (req, res) => {
-  const { circle_name } = req.body;
+  const circle_name = req.body.circle_name?.trim();
+  if (!circle_name) {
+    return res.status(400).json({ error: 'Circle name is required' });
+  }
+  if (circle_name.length > 100) {
+    return res.status(400).json({ error: 'Circle name is too long (max 100 characters)' });
+  }
   try {
     const result = await db.query(
-      'INSERT INTO peer_circles (circle_name) VALUES ($1) RETURNING *',
-      [circle_name]
+      'INSERT INTO peer_circles (circle_name, created_by) VALUES ($1, $2) RETURNING *',
+      [circle_name, req.user.id]
     );
     const circle = result.rows[0];
     await db.query(
@@ -355,8 +489,13 @@ app.post('/circles', authenticateToken, async (req, res) => {
 });
 
 app.post('/circles/join', authenticateToken, async (req, res) => {
-  const { circle_id } = req.body;
+  const circle_id = Number(req.body.circle_id);
+  if (!Number.isInteger(circle_id) || circle_id <= 0) {
+    return res.status(400).json({ error: 'Valid circle_id is required' });
+  }
   try {
+    const circle = await db.query('SELECT id FROM peer_circles WHERE id = $1', [circle_id]);
+    if (circle.rows.length === 0) return res.status(404).json({ error: 'Circle not found' });
     await db.query(
       'INSERT INTO circle_members (circle_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
       [circle_id, req.user.id]
@@ -367,20 +506,85 @@ app.post('/circles/join', authenticateToken, async (req, res) => {
   }
 });
 
-app.get('/leaderboard/:circleId', authenticateToken, async (req, res) => {
-  const { circleId } = req.params;
+// Leave a circle. If you were the last member the circle (and its
+// invites) is removed; if you were the creator, creator passes to the
+// longest-standing remaining member.
+app.delete('/circles/:id/leave', authenticateToken, async (req, res) => {
+  const circleId = Number(req.params.id);
+  if (!Number.isInteger(circleId) || circleId <= 0) {
+    return res.status(400).json({ error: 'Valid circle id is required' });
+  }
   try {
+    const del = await db.query(
+      'DELETE FROM circle_members WHERE circle_id = $1 AND user_id = $2 RETURNING user_id',
+      [circleId, req.user.id]
+    );
+    if (del.rows.length === 0) return res.status(404).json({ error: 'You are not a member of this circle' });
+
+    const remaining = await db.query(
+      'SELECT user_id FROM circle_members WHERE circle_id = $1 ORDER BY joined_at LIMIT 1',
+      [circleId]
+    );
+    if (remaining.rows.length === 0) {
+      await db.query('DELETE FROM peer_circles WHERE id = $1', [circleId]);
+      return res.json({ message: 'Left circle. No members remained, so the circle was removed.' });
+    }
+    await db.query(
+      'UPDATE peer_circles SET created_by = $1 WHERE id = $2 AND (created_by = $3 OR created_by IS NULL)',
+      [remaining.rows[0].user_id, circleId, req.user.id]
+    );
+    res.json({ message: 'Left circle.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete a whole circle (creator only). Members/invites cascade.
+app.delete('/circles/:id', authenticateToken, async (req, res) => {
+  const circleId = Number(req.params.id);
+  if (!Number.isInteger(circleId) || circleId <= 0) {
+    return res.status(400).json({ error: 'Valid circle id is required' });
+  }
+  try {
+    const circle = await db.query('SELECT id, created_by FROM peer_circles WHERE id = $1', [circleId]);
+    if (circle.rows.length === 0) return res.status(404).json({ error: 'Circle not found' });
+    if (circle.rows[0].created_by !== req.user.id) {
+      return res.status(403).json({ error: 'Only the circle creator can delete it. You can leave instead.' });
+    }
+    await db.query('DELETE FROM peer_circles WHERE id = $1', [circleId]);
+    res.json({ message: 'Circle deleted.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/leaderboard/:circleId', authenticateToken, async (req, res) => {
+  const circleId = Number(req.params.circleId);
+  if (!Number.isInteger(circleId) || circleId <= 0) {
+    return res.status(400).json({ error: 'Valid circle id is required' });
+  }
+  try {
+    const memberCheck = await db.query(
+      'SELECT 1 FROM circle_members WHERE circle_id = $1 AND user_id = $2',
+      [circleId, req.user.id]
+    );
+    if (memberCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'You must be a member of this circle' });
+    }
+    // Per-goal savings % first (spent/limit*100), then best per member.
+    // Members without goals appear last with null savings.
     const query = `
-      SELECT 
-        u.username, 
-        MAX((sg.amount_limit + COALESCE(SUM(tl.amount), 0)) / sg.amount_limit * 100) as best_percentage
+      SELECT u.username, ROUND(MAX(gs.savings_pct), 2) AS best_percentage
       FROM users u
-      JOIN circle_members cm ON u.id = cm.user_id
-      JOIN savings_goals sg ON u.id = sg.user_id
-      LEFT JOIN transaction_ledger tl ON sg.id = tl.goal_id
-      WHERE cm.circle_id = $1
+      JOIN circle_members cm ON cm.user_id = u.id AND cm.circle_id = $1
+      LEFT JOIN (
+        SELECT sg.user_id, (ABS(COALESCE(SUM(tl.amount), 0)) / NULLIF(sg.amount_limit, 0) * 100) AS savings_pct
+        FROM savings_goals sg
+        LEFT JOIN transaction_ledger tl ON tl.goal_id = sg.id
+        GROUP BY sg.id, sg.user_id, sg.amount_limit
+      ) gs ON gs.user_id = u.id
       GROUP BY u.id, u.username
-      ORDER BY best_percentage DESC;
+      ORDER BY MAX(gs.savings_pct) DESC NULLS LAST;
     `;
     const result = await db.query(query, [circleId]);
     res.json(result.rows);
@@ -393,18 +597,21 @@ app.get('/leaderboard/:circleId', authenticateToken, async (req, res) => {
 // --- Invite System ---
 
 app.post('/circles/invite', authenticateToken, async (req, res) => {
-  const { circle_id } = req.body;
+  const circle_id = Number(req.body.circle_id);
+  if (!Number.isInteger(circle_id) || circle_id <= 0) {
+    return res.status(400).json({ error: 'Valid circle_id is required' });
+  }
   try {
     const memberCheck = await db.query('SELECT 1 FROM circle_members WHERE circle_id = $1 AND user_id = $2', [circle_id, req.user.id]);
     if (memberCheck.rows.length === 0) return res.status(403).json({ error: 'You must be a member to invite others' });
 
-    const token = Math.random().toString(36).substring(2, 15);
+    const token = crypto.randomBytes(9).toString('base64url');
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + 7);
 
     await db.query(
-      'INSERT INTO invites (circle_id, token, expires_at) VALUES ($1, $2, $3)',
-      [circle_id, token, expiresAt]
+      'INSERT INTO invites (circle_id, token, expires_at, invited_by) VALUES ($1, $2, $3, $4)',
+      [circle_id, token, expiresAt, req.user.id]
     );
     res.json({ invite_token: token });
   } catch (err) {
@@ -413,7 +620,10 @@ app.post('/circles/invite', authenticateToken, async (req, res) => {
 });
 
 app.post('/circles/join-invite', authenticateToken, async (req, res) => {
-  const { token } = req.body;
+  const token = req.body.token?.trim();
+  if (!token) {
+    return res.status(400).json({ error: 'Invite token is required' });
+  }
   try {
     const inviteRes = await db.query('SELECT circle_id FROM invites WHERE token = $1 AND expires_at > NOW()', [token]);
     if (inviteRes.rows.length === 0) return res.status(400).json({ error: 'Invalid or expired invite token' });
@@ -423,8 +633,31 @@ app.post('/circles/join-invite', authenticateToken, async (req, res) => {
       'INSERT INTO circle_members (circle_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
       [circleId, req.user.id]
     );
-    await db.query('DELETE FROM invites WHERE token = $1', [token]);
-    res.json({ message: 'Joined circle via invite!' });
+    // Multi-use token: stays valid for other friends until expiry.
+    res.json({ message: 'Joined circle via invite!', circle_id: circleId });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Public invite-link preview for the /join/:token landing card.
+// Minimal info only: anyone holding the link can see it.
+app.get('/circles/invite/:token', async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT pc.id AS circle_id, pc.circle_name,
+              (SELECT COUNT(*)::int FROM circle_members WHERE circle_id = pc.id) AS member_count,
+              u.username AS inviter, i.expires_at
+       FROM invites i
+       JOIN peer_circles pc ON pc.id = i.circle_id
+       LEFT JOIN users u ON u.id = i.invited_by
+       WHERE i.token = $1 AND i.expires_at > NOW()`,
+      [req.params.token]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Invalid or expired invite link' });
+    }
+    res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
