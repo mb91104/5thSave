@@ -176,12 +176,6 @@ function App() {
     { name: 'Remaining', value: Math.max(0, 100 - stats.best) },
   ], [stats.best]);
 
-  const progressFor = (goal) => {
-    const rel = rewards.filter((r) => String(r.goal_id) === String(goal.id));
-    if (!rel.length) return 0;
-    return Math.max(...rel.map((r) => Number(r.checkpoint_percentage)));
-  };
-
   const handleAuth = async (e) => {
     e.preventDefault();
     setAuthError('');
@@ -227,8 +221,14 @@ function App() {
 
   const endGoal = async (goalId) => {
     try {
-      await axios.post(`${API_BASE}/goals/${goalId}/end`, {}, { headers: authHeaders });
-      toast(`Goal #${goalId} marked complete.`);
+      const res = await axios.post(`${API_BASE}/goals/${goalId}/end`, {}, { headers: authHeaders });
+      const earned = res.data.rewards || [];
+      const score = res.data.saver_score;
+      if (earned.length) {
+        toast(`Goal complete! Saver score ${score}% · Rewards: ${earned.map((r) => r.reward_item).join(', ')}`);
+      } else {
+        toast(`Goal complete. Saver score ${score}% — no rewards this time. Spend less next window.`);
+      }
       fetchGoals();
       fetchRewards();
     } catch (err) { toast(err.response?.data?.error || 'Failed to end goal'); }
@@ -249,16 +249,66 @@ function App() {
     } catch (err) { toast(err.response?.data?.error || 'Failed to remove item'); }
   };
 
+  const [spotlight, setSpotlight] = useState(null);
+
+  const milestoneName = (pct) => (MILESTONES.find((m) => m.pct === pct)?.name || `${pct}% reward`);
+
   const checkout = async () => {
     if (!activeGoalId) return toast('Select a goal to link this purchase.');
+    const gid = Number(activeGoalId);
+    const goalBefore = goals.find((g) => String(g.id) === String(gid));
+    const limit = Number(goalBefore?.amount_limit) || 0;
+    const spentBefore = Number(goalBefore?.total_spent) || 0;
     try {
-      const res = await axios.post(`${API_BASE}/shop/checkout`, { goalId: Number(activeGoalId) }, { headers: authHeaders });
+      const res = await axios.post(`${API_BASE}/shop/checkout`, { goalId: gid }, { headers: authHeaders });
+      const deducted = Number(res.data.totalAmount) || 0;
+      const spentAfter = spentBefore + deducted;
+      const pctAfter = limit > 0 ? (spentAfter / limit) * 100 : 0;
+      // Saver score AFTER this purchase: what finishing right now would bank.
+      const saverAfter = Math.max(0, 100 - pctAfter);
+      const onTrack = [25, 50, 75, 100].filter((cp) => saverAfter >= cp);
+      const nextCp = [25, 50, 75, 100].find((cp) => cp > saverAfter) || null;
       setReceipt(res.data);
+      setSpotlight({
+        goalId: gid,
+        deducted, limit, spentAfter, pctAfter, saverAfter,
+        claimed: (res.data.expiry_rewards || []).map((r) => ({ pct: Number(r.checkpoint_percentage), name: r.reward_item })),
+        onTrack: onTrack.map((cp) => ({ pct: cp, name: milestoneName(cp) })),
+        next: nextCp ? { pct: nextCp, name: milestoneName(nextCp), headroom: Math.max(0, (1 - nextCp / 100) * limit - spentAfter) } : null,
+      });
       setCart([]);
       await fetchGoals();
       await fetchRewards();
-      toast('Payment successful. Timeline advanced by 1 day.');
+      if (res.data.goal_expired) {
+        const rw = res.data.expiry_rewards || [];
+        toast(rw.length
+          ? `Window closed on checkout! Goal completed · Rewards: ${rw.map((r) => r.reward_item).join(', ')}`
+          : 'Window closed on checkout — goal completed.');
+      } else {
+        toast(`Payment successful · saver score ${saverAfter.toFixed(0)}%. Timeline +1 day.`);
+      }
     } catch (err) { toast(err.response?.data?.error || 'Checkout failed'); }
+  };
+
+  const closeReceipt = () => {
+    setReceipt(null);
+    setSpotlight(null);
+  };
+
+  const skipTime = async (goal, interval, days) => {
+    try {
+      const res = await axios.post(`${API_BASE}/goals/${goal.id}/skip-time`, { interval }, { headers: authHeaders });
+      if (res.data.expired) {
+        const rw = res.data.rewards || [];
+        toast(rw.length
+          ? `Window closed! Goal #${goal.id} completed · Saver ${res.data.saver_score}% · Rewards: ${rw.map((r) => r.reward_item).join(', ')}`
+          : `Window closed — goal #${goal.id} completed with saver score ${res.data.saver_score}%.`);
+      } else {
+        toast(`Goal #${goal.id} timeline advanced by ${days} day${days === 1 ? '' : 's'}.`);
+      }
+      fetchGoals();
+      fetchRewards();
+    } catch (err) { toast(err.response?.data?.error || 'Failed to advance timeline'); }
   };
 
   const createCircle = async (e) => {
@@ -560,11 +610,13 @@ function App() {
 
                 <div className="goal-list">
                   {goals.map((g) => {
-                    const pct = progressFor(g);
                     const spent = Number(g.total_spent || 0);
                     const limit = Number(g.amount_limit) || 0;
                     const dep = limit > 0 ? (spent / limit) * 100 : 0;
-                    const depCls = dep >= 100 ? 'over' : dep >= 75 ? 'high' : dep >= 50 ? 'mid' : 'low';
+                    const saver = Math.max(0, 100 - dep);
+                    // Saver meter: fill = saver score, ticks sit exactly on the
+                    // 25/50/75 reward checkpoints.
+                    const savCls = saver >= 50 ? 'low' : saver >= 25 ? 'mid' : saver > 0 ? 'high' : 'over';
                     const left = limit - spent;
                     return (
                       <div key={g.id} className="holding">
@@ -572,8 +624,8 @@ function App() {
                         <div className="holding-mid">
                           <div className="holding-name">Goal #{g.id} · {g.status}</div>
                           <div className="holding-sub">{fmtDate(g.start_date)} → {fmtDate(g.end_date)}</div>
-                          <div className={`deplete ${depCls}`}>
-                            <div className="deplete-fill" style={{ width: `${Math.min(dep, 100)}%` }} />
+                          <div className={`deplete ${savCls}`}>
+                            <div className="deplete-fill" style={{ width: `${saver}%` }} />
                             {[25, 50, 75].map((t) => (
                               <span key={t} className="deplete-tick" style={{ left: `${t}%` }} />
                             ))}
@@ -586,11 +638,19 @@ function App() {
                         </div>
                         <div className="holding-right">
                           <div className="holding-amt">{inr(limit)}</div>
-                          <div className={`holding-pnl ${pct > 0 ? 'up' : 'flat'}`}>{pct > 0 ? `▲ ${pct}%` : '— 0%'} milestone</div>
+                          <div className={`holding-pnl ${saver >= 50 ? 'up' : 'flat'}`}>{saver.toFixed(0)}% saver score</div>
                           <div style={{ display: 'flex', gap: 6, marginTop: 8, justifyContent: 'flex-end' }}>
                             <button className="mini-btn primary" onClick={() => { setActiveGoalId(String(g.id)); setCurrentPage('shop'); }}>Shop</button>
                             {g.status === 'active' && <button className="mini-btn" onClick={() => endGoal(g.id)}>Complete</button>}
                           </div>
+                          {g.status === 'active' && (
+                            <div className="skip-row">
+                              <span>Time:</span>
+                              <button className="mini-btn skip-btn" title="Advance timeline by 1 day" onClick={() => skipTime(g, 'day', 1)}>+1d</button>
+                              <button className="mini-btn skip-btn" title="Advance timeline by 7 days" onClick={() => skipTime(g, 'week', 7)}>+7d</button>
+                              <button className="mini-btn skip-btn" title="Advance timeline by 30 days" onClick={() => skipTime(g, 'month', 30)}>+30d</button>
+                            </div>
+                          )}
                         </div>
                       </div>
                     );
@@ -740,6 +800,46 @@ function App() {
                   </>
                 ) : <div className="empty">Your cart is empty.</div>}
 
+                {spotlight && (() => {
+                  const spotGoal = goals.find((g) => String(g.id) === String(spotlight.goalId));
+                  const sav = Math.max(0, spotlight.saverAfter);
+                  const savCls = sav >= 50 ? 'low' : sav >= 25 ? 'mid' : sav > 0 ? 'high' : 'over';
+                  return (
+                    <div className="spotlight">
+                      <div className="spot-label">Payment complete · Goal #{spotlight.goalId}</div>
+                      <div className="spot-amt">−{inr(spotlight.deducted)}</div>
+                      <div className="spot-sub">deducted · saver score {spotlight.saverAfter.toFixed(1)}% ({spotlight.pctAfter.toFixed(1)}% of {inr(spotlight.limit)} used)</div>
+                      <div className={`deplete ${savCls}`}>
+                        <div className="deplete-fill" style={{ width: `${Math.min(sav, 100)}%` }} />
+                        {[25, 50, 75].map((t) => (
+                          <span key={t} className="deplete-tick" style={{ left: `${t}%` }} />
+                        ))}
+                      </div>
+                      {spotlight.claimed.length > 0 ? (
+                        <div className="spot-reward">
+                          Reward granted: {spotlight.claimed.map((u) => `${u.name} (${u.pct}%)`).join(', ')}
+                        </div>
+                      ) : spotlight.onTrack.length > 0 ? (
+                        <div className="spot-reward">
+                          On track for: {spotlight.onTrack.map((u) => `${u.name} (${u.pct}%)`).join(', ')} — finish the goal to claim
+                        </div>
+                      ) : (
+                        <div className="spot-next">
+                          Over budget — finish the goal to reset, or spend less next window.
+                        </div>
+                      )}
+                      {spotlight.next && (
+                        <div className="spot-next">
+                          Spend {inr(spotlight.next.headroom)} more at most to reach {spotlight.next.name} ({spotlight.next.pct}%)
+                        </div>
+                      )}
+                      {spotGoal?.start_date && (
+                        <div className="spot-time">Timeline +1 day · goal active since {fmtDate(spotGoal.start_date)}</div>
+                      )}
+                    </div>
+                  );
+                })()}
+
                 {receipt && (
                   <div className="receipt">
                     <h4>Receipt · Order #{receipt.orderId}</h4>
@@ -749,7 +849,7 @@ function App() {
                     <div className="receipt-row" style={{ fontWeight: 700, borderTop: '1px solid var(--border)', marginTop: 6, paddingTop: 8 }}>
                       <span>Total paid</span><span>{inr(receipt.totalAmount)}</span>
                     </div>
-                    <button className="mini-btn" style={{ width: '100%', marginTop: 10 }} onClick={() => setReceipt(null)}>Close receipt</button>
+                    <button className="mini-btn" style={{ width: '100%', marginTop: 10 }} onClick={closeReceipt}>Close receipt</button>
                   </div>
                 )}
               </div>

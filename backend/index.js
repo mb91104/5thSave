@@ -137,12 +137,16 @@ app.post('/shop/checkout', authenticateToken, async (req, res) => {
 
     // Goal must exist and belong to the buyer
     const goalRes = await client.query(
-      'SELECT id FROM savings_goals WHERE id = $1 AND user_id = $2',
+      'SELECT id, status FROM savings_goals WHERE id = $1 AND user_id = $2',
       [goalId, req.user.id]
     );
     if (goalRes.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Goal not found or not yours' });
+    }
+    if (goalRes.rows[0].status !== 'active') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Goal is already completed — create a new goal to keep shopping.' });
     }
 
     // 1. Get cart items
@@ -184,22 +188,20 @@ app.post('/shop/checkout', authenticateToken, async (req, res) => {
     // 4. Clear Cart
     await client.query('DELETE FROM cart_items WHERE user_id = $1', [req.user.id]);
 
-    // 5. AUTOMATIC TIME SKIP: +1 day per checkout as a progression marker
-    await client.query(
-      'UPDATE savings_goals SET start_date = start_date + $1 * INTERVAL \'1 day\' WHERE id = $2',
-      [1, goalId]
-    );
-
     await client.query('COMMIT');
 
-    // 6. Award rewards (read-only; safe outside the transaction)
-    await checkAndAwardRewards(req.user.id, goalId);
+    // 5. AUTOMATIC TIME SKIP (+1 day) with window-expiry check:
+    // if the window elapsed, the goal auto-completes and pays rewards.
+    const expiry = await advanceClock(req.user.id, goalId, 1);
 
     res.status(201).json({
       message: 'Checkout successful!',
       orderId,
       totalAmount: totalOrderAmount,
       receipt: items.map((it) => ({ ...it, price: Number(it.price) })),
+      goal_expired: expiry.expired,
+      expiry_rewards: expiry.rewards || [],
+      expiry_saver: expiry.saver_score ?? null,
     });
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch { /* already closed */ }
@@ -220,7 +222,15 @@ app.post('/goals/:id/end', authenticateToken, async (req, res) => {
     if (goalCheck.rows.length === 0) return res.status(403).json({ error: 'Goal not found or not yours' });
 
     const result = await db.query("UPDATE savings_goals SET status = 'completed' WHERE id = $1 RETURNING *", [goalId]);
-    res.json({ message: 'Goal ended successfully!', goal: result.rows[0] });
+    const goal = result.rows[0];
+    const { granted, saverScore, totalSpent } = await checkAndAwardRewards(req.user.id, goalId);
+    res.json({
+      message: 'Goal ended successfully!',
+      goal,
+      saver_score: saverScore,
+      total_spent: totalSpent,
+      rewards: granted,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -229,43 +239,72 @@ app.post('/goals/:id/end', authenticateToken, async (req, res) => {
 // --- Goal Routes ---
 
 
+// Savings-based rewards: granted ONLY when a goal is completed — never for spending.
+// saver_score = (limit - spent) / limit * 100, clamped at 0.
+// Finishing with savings above a checkpoint earns its voucher.
+// Returns the newly granted reward rows.
 async function checkAndAwardRewards(userId, goalId) {
+  const rewardMap = {
+    25: 'Flipkart Voucher',
+    50: 'Amazon Giftcard',
+    75: 'Makemytrip Voucher',
+    100: 'Ultimate Saver Reward'
+  };
+  const checkpoints = [25, 50, 75, 100];
+  const granted = [];
+  let saverScore = 0, totalSpent = 0, limit = 0;
   try {
     const goalRes = await db.query('SELECT amount_limit FROM savings_goals WHERE id = $1', [goalId]);
-    if (goalRes.rows.length === 0) return;
-    const limit = parseFloat(goalRes.rows[0].amount_limit);
-    if (!limit || limit <= 0) return;
+    if (goalRes.rows.length === 0) return { granted, saverScore, totalSpent, limit };
+    limit = parseFloat(goalRes.rows[0].amount_limit);
+    if (!limit || limit <= 0) return { granted, saverScore, totalSpent, limit };
 
-    const spendingRes = await db.query('SELECT SUM(amount) as total FROM transaction_ledger WHERE goal_id = $1', [goalId]);
-    const totalSpent = Math.abs(parseFloat(spendingRes.rows[0].total || 0));
-    
-    const percentage = (totalSpent / limit) * 100;
+    const spendingRes = await db.query(
+      'SELECT COALESCE(SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END), 0) AS spent FROM transaction_ledger WHERE goal_id = $1',
+      [goalId]
+    );
+    totalSpent = parseFloat(spendingRes.rows[0].spent || 0);
+    saverScore = Math.max(0, ((limit - totalSpent) / limit) * 100);
 
-    const rewardMap = {
-      25: 'Flipkart Voucher',
-      50: 'Amazon Giftcard',
-      75: 'Makemytrip Voucher',
-      100: 'Ultimate Saver Reward'
-    };
-
-    const checkpoints = [25, 50, 75, 100];
     for (const cp of checkpoints) {
-      if (percentage >= cp) {
+      if (saverScore >= cp) {
         const rewardCheck = await db.query(
           'SELECT id FROM rewards WHERE user_id = $1 AND goal_id = $2 AND checkpoint_percentage = $3',
           [userId, goalId, cp]
         );
         if (rewardCheck.rows.length === 0) {
-          await db.query(
-            'INSERT INTO rewards (user_id, goal_id, checkpoint_percentage, reward_item) VALUES ($1, $2, $3, $4)',
+          const ins = await db.query(
+            'INSERT INTO rewards (user_id, goal_id, checkpoint_percentage, reward_item) VALUES ($1, $2, $3, $4) RETURNING *',
             [userId, goalId, cp, rewardMap[cp]]
           );
+          granted.push(ins.rows[0]);
         }
       }
     }
   } catch (err) {
     console.error('Reward Error:', err);
   }
+  return { granted, saverScore: Math.round(saverScore * 100) / 100, totalSpent, limit };
+}
+
+// Advance a goal's clock; if the savings window has elapsed
+// (start_date reached end_date), auto-complete the goal and grant
+// savings rewards. Returns expiry info for the response.
+async function advanceClock(userId, goalId, days) {
+  await db.query(
+    'UPDATE savings_goals SET start_date = start_date + $1 * INTERVAL \'1 day\' WHERE id = $2 AND user_id = $3',
+    [days, goalId, userId]
+  );
+  const cur = await db.query(
+    'SELECT start_date, end_date, status FROM savings_goals WHERE id = $1 AND user_id = $2',
+    [goalId, userId]
+  );
+  if (!cur.rows.length) return { expired: false };
+  const { start_date, end_date, status } = cur.rows[0];
+  if (status !== 'active' || new Date(start_date) < new Date(end_date)) return { expired: false };
+  await db.query("UPDATE savings_goals SET status = 'completed' WHERE id = $1", [goalId]);
+  const { granted, saverScore, totalSpent } = await checkAndAwardRewards(userId, goalId);
+  return { expired: true, rewards: granted, saver_score: saverScore, total_spent: totalSpent };
 }
 
 app.post('/goals', authenticateToken, async (req, res) => {
@@ -372,9 +411,7 @@ app.post('/shop/buy', authenticateToken, async (req, res) => {
       'INSERT INTO transaction_ledger (goal_id, amount, transaction_type, description) VALUES ($1, $2, $3, $4) RETURNING *',
       [goalId, amount, 'spend', `Bought ${product.name}`]
     );
-    
-    await checkAndAwardRewards(req.user.id, goalId);
-    
+
     res.status(201).json({ message: `Bought ${product.name}!`, transaction: result.rows[0] });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -389,21 +426,30 @@ app.post('/goals/:id/skip-time', authenticateToken, async (req, res) => {
   const { interval } = req.body;
 
   let days = 0;
-  if (interval === 'week') days = 7;
+  if (interval === 'day') days = 1;
+  else if (interval === 'week') days = 7;
   else if (interval === 'month') days = 30;
-  else return res.status(400).json({ error: 'Invalid interval. Use week or month.' });
+  else return res.status(400).json({ error: 'Invalid interval. Use day, week or month.' });
 
   try {
-    const goalCheck = await db.query('SELECT id, start_date FROM savings_goals WHERE id = $1 AND user_id = $2', [goalId, req.user.id]);
+    const goalCheck = await db.query('SELECT id, status FROM savings_goals WHERE id = $1 AND user_id = $2', [goalId, req.user.id]);
     if (goalCheck.rows.length === 0) return res.status(403).json({ error: 'Goal not found or not yours' });
+    if (goalCheck.rows[0].status !== 'active') {
+      return res.status(400).json({ error: 'Goal is already completed — its timeline is frozen.' });
+    }
 
-    await db.query(
-      'UPDATE savings_goals SET start_date = start_date + $1 * INTERVAL \'1 day\' WHERE id = $2',
-      [days, goalId]
-    );
+    const expiry = await advanceClock(req.user.id, goalId, days);
 
-    await checkAndAwardRewards(req.user.id, goalId);
-    res.json({ message: `${interval} skipped successfully!` });
+    if (expiry.expired) {
+      return res.json({
+        message: 'Window closed — goal completed automatically!',
+        expired: true,
+        rewards: expiry.rewards,
+        saver_score: expiry.saver_score,
+        total_spent: expiry.total_spent,
+      });
+    }
+    res.json({ message: `${interval} skipped successfully!`, expired: false });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -431,7 +477,6 @@ app.post('/transactions', authenticateToken, async (req, res) => {
       'INSERT INTO transaction_ledger (goal_id, amount, transaction_type, description) VALUES ($1, $2, $3, $4) RETURNING *',
       [goalId, value, transaction_type, description || null]
     );
-    await checkAndAwardRewards(req.user.id, goalId);
     res.status(201).json(result.rows[0]);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -571,20 +616,21 @@ app.get('/leaderboard/:circleId', authenticateToken, async (req, res) => {
     if (memberCheck.rows.length === 0) {
       return res.status(403).json({ error: 'You must be a member of this circle' });
     }
-    // Per-goal savings % first (spent/limit*100), then best per member.
-    // Members without goals appear last with null savings.
+    // Per-goal SAVER score first ((limit - spent)/limit*100, floored at 0),
+    // then best per member. Members without goals appear last with null.
     const query = `
-      SELECT u.username, ROUND(MAX(gs.savings_pct), 2) AS best_percentage
+      SELECT u.username, ROUND(MAX(gs.saver_pct), 2) AS best_percentage
       FROM users u
       JOIN circle_members cm ON cm.user_id = u.id AND cm.circle_id = $1
       LEFT JOIN (
-        SELECT sg.user_id, (ABS(COALESCE(SUM(tl.amount), 0)) / NULLIF(sg.amount_limit, 0) * 100) AS savings_pct
+        SELECT sg.user_id,
+               GREATEST(0, (sg.amount_limit - COALESCE(SUM(CASE WHEN tl.amount < 0 THEN -tl.amount ELSE 0 END), 0)) / NULLIF(sg.amount_limit, 0) * 100) AS saver_pct
         FROM savings_goals sg
         LEFT JOIN transaction_ledger tl ON tl.goal_id = sg.id
         GROUP BY sg.id, sg.user_id, sg.amount_limit
       ) gs ON gs.user_id = u.id
       GROUP BY u.id, u.username
-      ORDER BY MAX(gs.savings_pct) DESC NULLS LAST;
+      ORDER BY MAX(gs.saver_pct) DESC NULLS LAST;
     `;
     const result = await db.query(query, [circleId]);
     res.json(result.rows);
