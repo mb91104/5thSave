@@ -31,10 +31,16 @@
   --accent-soft: #DCD7EC; --accent-line: #B3A9D4;
   --page-bg: #E2DEF0; --page-glow: rgba(124, 134, 168, 0.20);
 }
+.app.theme-report {
+  --accent: #1D4ED8; --accent-ink: #1E3A8A;
+  --accent-soft: #DBEAFE; --accent-line: #93C5FD;
+  --page-bg: #E3EAF6; --page-glow: rgba(59, 89, 152, 0.18);
+}
 
 body:has(.theme-dashboard) { background: radial-gradient(900px 300px at 50% -80px, var(--page-glow), transparent 70%), linear-gradient(180deg, var(--page-bg), #f7f8f7 55%, #f4f5f7); }
 body:has(.theme-shop) { background: radial-gradient(900px 300px at 50% -80px, var(--page-glow), transparent 70%), linear-gradient(180deg, var(--page-bg), #fbf8f3 55%, #f4f5f7); }
 body:has(.theme-social) { background: radial-gradient(900px 300px at 50% -80px, var(--page-glow), transparent 70%), linear-gradient(180deg, var(--page-bg), #f5f7fc 55%, #f4f5f7); }
+body:has(.theme-report) { background: radial-gradient(900px 300px at 50% -80px, var(--page-glow), transparent 70%), linear-gradient(180deg, var(--page-bg), #f2f6fd 55%, #f4f5f7); }
 
 /* Groww-style full-bleed header */
 .topbar {

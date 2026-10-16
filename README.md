@@ -24,6 +24,7 @@
 2. Install dependencies: `npm install`
 3. Configure your `.env` file with `DATABASE_URL` and `JWT_SECRET`.
 4. Start the server: `npm start` (Runs on port 3000).
+5. Run checks: `npm test` (needs PostgreSQL running; boots its own server on port 3457 and cleans up after itself).
 
 ### Frontend
 1. Navigate to the frontend directory: `cd frontend`

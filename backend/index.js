@@ -10,6 +10,11 @@ const db = require('./db');
 // accident invalidates every issued token.)
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
+if (!process.env.JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET is not set. Define it in backend/.env (canonical) and restart.');
+  process.exit(1);
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -30,10 +35,29 @@ const authenticateToken = (req, res, next) => {
 
 // --- Auth Routes ---
 
+// Normalize emails so "User@Example.com " and "user@example.com" are the same account.
+const normalizeEmail = (email) => String(email || '').trim().toLowerCase();
+const isValidEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
+app.get('/auth/me', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query('SELECT id, username, email FROM users WHERE id = $1', [req.user.id]);
+    if (result.rows.length === 0) return res.status(401).json({ error: 'Session expired. Please sign out and sign in again.' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/auth/register', async (req, res) => {
-  const { username, email, password } = req.body;
-  if (!username?.trim() || !email?.trim() || !password) {
+  const username = req.body.username?.trim();
+  const email = normalizeEmail(req.body.email);
+  const { password } = req.body;
+  if (!username || !email || !password) {
     return res.status(400).json({ error: 'Username, email and password are required' });
+  }
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ error: 'Enter a valid email address' });
   }
   if (password.length < 6) {
     return res.status(400).json({ error: 'Password must be at least 6 characters' });
@@ -42,7 +66,7 @@ app.post('/auth/register', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
     const result = await db.query(
       'INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username',
-      [username.trim(), email.trim(), hashedPassword]
+      [username, email, hashedPassword]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -54,9 +78,14 @@ app.post('/auth/register', async (req, res) => {
 });
 
 app.post('/auth/login', async (req, res) => {
-  const { email, password } = req.body;
+  const email = normalizeEmail(req.body.email);
+  const { password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password are required' });
+  }
   try {
-    const result = await db.query('SELECT * FROM users WHERE email = $1', [email]);
+    // LOWER() keeps older mixed-case accounts (e.g. Mb91104@Gmail.com) working.
+    const result = await db.query('SELECT * FROM users WHERE LOWER(email) = LOWER($1)', [email]);
     const user = result.rows[0];
     if (!user) {
       return res.status(401).json({ error: 'Invalid credentials' });
@@ -212,6 +241,26 @@ app.post('/shop/checkout', authenticateToken, async (req, res) => {
   }
 });
 
+// Order history for the Report page: every bought item with its category.
+app.get('/orders', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT o.id AS order_id, o.goal_id, o.total_amount, o.order_date,
+              oi.quantity, oi.price_at_purchase,
+              p.name AS product_name, p.category
+       FROM orders o
+       JOIN order_items oi ON oi.order_id = o.id
+       JOIN products p ON p.id = oi.product_id
+       WHERE o.user_id = $1
+       ORDER BY o.order_date DESC, o.id DESC`,
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/goals/:id/end', authenticateToken, async (req, res) => {
   const goalId = Number(req.params.id);
   if (!Number.isInteger(goalId) || goalId <= 0) {
@@ -260,10 +309,12 @@ async function checkAndAwardRewards(userId, goalId) {
     if (!limit || limit <= 0) return { granted, saverScore, totalSpent, limit };
 
     const spendingRes = await db.query(
-      'SELECT COALESCE(SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END), 0) AS spent FROM transaction_ledger WHERE goal_id = $1',
+      // Net outflow: spends are negative, refunds/positive adjustments offset them.
+      // (Summing only negative rows would silently ignore refunds.)
+      'SELECT COALESCE(-SUM(amount), 0) AS spent FROM transaction_ledger WHERE goal_id = $1',
       [goalId]
     );
-    totalSpent = parseFloat(spendingRes.rows[0].spent || 0);
+    totalSpent = Math.max(0, parseFloat(spendingRes.rows[0].spent || 0));
     saverScore = Math.max(0, ((limit - totalSpent) / limit) * 100);
 
     for (const cp of checkpoints) {
@@ -336,7 +387,7 @@ app.get('/goals', authenticateToken, async (req, res) => {
   try {
     const result = await db.query(
       `SELECT sg.*,
-              COALESCE(SUM(CASE WHEN tl.amount < 0 THEN -tl.amount ELSE 0 END), 0)::float AS total_spent,
+              GREATEST(0, -COALESCE(SUM(tl.amount), 0))::float AS total_spent,
               COUNT(tl.id)::int AS tx_count
        FROM savings_goals sg
        LEFT JOIN transaction_ledger tl ON tl.goal_id = sg.id
@@ -355,6 +406,46 @@ app.delete('/goals', authenticateToken, async (req, res) => {
   try {
     await db.query('DELETE FROM savings_goals WHERE user_id = $1', [req.user.id]);
     res.json({ message: 'All goals cleared successfully!' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete ONE goal. Its ledger rows, orders and rewards cascade automatically.
+app.delete('/goals/:id', authenticateToken, async (req, res) => {
+  const goalId = Number(req.params.id);
+  if (!Number.isInteger(goalId) || goalId <= 0) {
+    return res.status(400).json({ error: 'Valid goal id is required' });
+  }
+  try {
+    const result = await db.query(
+      'DELETE FROM savings_goals WHERE id = $1 AND user_id = $2 RETURNING id',
+      [goalId, req.user.id]
+    );
+    if (result.rows.length === 0) return res.status(403).json({ error: 'Goal not found or not yours' });
+    res.json({ message: `Goal #${goalId} deleted.` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Clear the rewards earned on ONE goal (e.g. after finishing, start fresh
+// without deleting the goal itself).
+app.delete('/goals/:id/rewards', authenticateToken, async (req, res) => {
+  const goalId = Number(req.params.id);
+  if (!Number.isInteger(goalId) || goalId <= 0) {
+    return res.status(400).json({ error: 'Valid goal id is required' });
+  }
+  try {
+    const goalCheck = await db.query('SELECT id FROM savings_goals WHERE id = $1 AND user_id = $2', [goalId, req.user.id]);
+    if (goalCheck.rows.length === 0) return res.status(403).json({ error: 'Goal not found or not yours' });
+    const result = await db.query('DELETE FROM rewards WHERE goal_id = $1 AND user_id = $2', [goalId, req.user.id]);
+    res.json({
+      message: result.rowCount
+        ? `Cleared ${result.rowCount} reward${result.rowCount === 1 ? '' : 's'} for goal #${goalId}.`
+        : `No rewards to clear for goal #${goalId}.`,
+      cleared: result.rowCount,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -469,6 +560,17 @@ app.post('/transactions', authenticateToken, async (req, res) => {
   }
   if (!['spend', 'refund', 'adjustment'].includes(transaction_type)) {
     return res.status(400).json({ error: 'transaction_type must be spend, refund or adjustment' });
+  }
+  // Sign must match the type, otherwise net saver math silently misbehaves
+  // (e.g. a positive "spend" would act as a refund).
+  if (value === 0) {
+    return res.status(400).json({ error: 'Amount must not be zero' });
+  }
+  if (transaction_type === 'spend' && value > 0) {
+    return res.status(400).json({ error: 'Spend amounts must be negative' });
+  }
+  if (transaction_type === 'refund' && value < 0) {
+    return res.status(400).json({ error: 'Refund amounts must be positive' });
   }
   try {
     const goalCheck = await db.query('SELECT id FROM savings_goals WHERE id = $1 AND user_id = $2', [goalId, req.user.id]);
@@ -624,7 +726,7 @@ app.get('/leaderboard/:circleId', authenticateToken, async (req, res) => {
       JOIN circle_members cm ON cm.user_id = u.id AND cm.circle_id = $1
       LEFT JOIN (
         SELECT sg.user_id,
-               GREATEST(0, (sg.amount_limit - COALESCE(SUM(CASE WHEN tl.amount < 0 THEN -tl.amount ELSE 0 END), 0)) / NULLIF(sg.amount_limit, 0) * 100) AS saver_pct
+               GREATEST(0, (sg.amount_limit + COALESCE(SUM(tl.amount), 0)) / NULLIF(sg.amount_limit, 0) * 100) AS saver_pct
         FROM savings_goals sg
         LEFT JOIN transaction_ledger tl ON tl.goal_id = sg.id
         GROUP BY sg.id, sg.user_id, sg.amount_limit

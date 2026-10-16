@@ -6,7 +6,7 @@ import {
   Tooltip, BarChart, Bar, XAxis, YAxis, CartesianGrid
 } from 'recharts';
 
-const API_BASE = 'http://localhost:3000';
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
 const MILESTONES = [
   { pct: 25, name: 'Flipkart Voucher' },
@@ -14,6 +14,8 @@ const MILESTONES = [
   { pct: 75, name: 'Makemytrip Voucher' },
   { pct: 100, name: 'Ultimate Saver Reward' },
 ];
+
+const PIE_COLORS = ['#4F6B6A', '#C97A1B', '#3B3566', '#B42318', '#047857', '#7c7e8c'];
 
 const inr = (n) => `₹${Number(n || 0).toLocaleString('en-IN')}`;
 
@@ -71,6 +73,7 @@ function App() {
   const [activeGoalId, setActiveGoalId] = useState('');
   const [currentPage, setCurrentPage] = useState('dashboard');
   const [cart, setCart] = useState([]);
+  const [orders, setOrders] = useState([]);
   const [receipt, setReceipt] = useState(null);
   const [toasts, setToasts] = useState([]);
 
@@ -84,11 +87,15 @@ function App() {
 
   // Stale/expired token: drop it and send the user back to sign-in
   // instead of failing every action silently.
+  // Login/register 401s (wrong password) must NOT clear the session —
+  // they are credential errors, not session errors.
   useEffect(() => {
     const id = axios.interceptors.response.use(
       (res) => res,
       (err) => {
-        if (err.response?.status === 401 && localStorage.getItem('token')) {
+        const url = err.config?.url || '';
+        const isAuthAttempt = url.includes('/auth/login') || url.includes('/auth/register');
+        if (err.response?.status === 401 && !isAuthAttempt && localStorage.getItem('token')) {
           localStorage.removeItem('token');
           setToken(null);
           setUser(null);
@@ -145,15 +152,28 @@ function App() {
       setCart(res.data);
     } catch (err) { console.error(err); }
   };
+  const fetchOrders = async () => {
+    try {
+      const res = await axios.get(`${API_BASE}/orders`, { headers: authHeaders });
+      setOrders(res.data);
+    } catch (err) { console.error(err); }
+  };
 
   useEffect(() => {
     if (token) {
+      // Rehydrate the user after a page reload (token persists, state doesn't).
+      if (!user) {
+        axios.get(`${API_BASE}/auth/me`, { headers: authHeaders })
+          .then((res) => setUser(res.data))
+          .catch(() => { /* interceptor handles expired tokens */ });
+      }
       fetchGoals();
       fetchRewards();
       fetchProducts();
       fetchCategories();
       fetchCircles();
       fetchCart();
+      fetchOrders();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
@@ -171,9 +191,44 @@ function App() {
     () => goals.slice(0, 7).map((g) => ({ name: `#${g.id}`, limit: Number(g.amount_limit) || 0 })),
     [goals]
   );
+
+  // Full spending + saving report, derived from goals, rewards and order history.
+  const report = useMemo(() => {
+    const perGoal = goals.map((g) => {
+      const limit = Number(g.amount_limit) || 0;
+      const spent = Number(g.total_spent) || 0;
+      const saved = limit - spent;
+      const pct = limit > 0 ? Math.max(0, 100 - (spent / limit) * 100) : 0;
+      const rw = rewards.filter((r) => String(r.goal_id) === String(g.id)).length;
+      return { id: g.id, limit, spent, saved, pct, status: g.status, rewards: rw };
+    });
+    const totalLimit = perGoal.reduce((s, g) => s + g.limit, 0);
+    const totalSpent = perGoal.reduce((s, g) => s + g.spent, 0);
+    const totalSaved = totalLimit - totalSpent;
+    const savedPct = totalLimit > 0 ? Math.max(0, (totalSaved / totalLimit) * 100) : 0;
+    // Category totals come from Buy-page purchases (orders carry the category).
+    const byCat = {};
+    orders.forEach((o) => {
+      const amt = Number(o.price_at_purchase) * Number(o.quantity);
+      const cat = o.category || 'Other';
+      byCat[cat] = (byCat[cat] || 0) + amt;
+    });
+    const catTotal = Object.values(byCat).reduce((s, v) => s + v, 0);
+    const catRows = Object.entries(byCat)
+      .map(([name, value]) => ({ name, value, share: catTotal > 0 ? (value / catTotal) * 100 : 0 }))
+      .sort((a, b) => b.value - a.value);
+    const byGoal = [...perGoal].sort((a, b) => b.spent - a.spent);
+    return {
+      perGoal, byGoal, totalLimit, totalSpent, totalSaved, savedPct,
+      catRows, catTotal,
+      topCat: catRows[0] || null,
+      topGoal: byGoal[0] || null,
+      bestGoal: [...perGoal].sort((a, b) => b.pct - a.pct)[0] || null,
+    };
+  }, [goals, rewards, orders]);
   const savingsPie = useMemo(() => [
-    { name: 'Achieved', value: stats.best },
-    { name: 'Remaining', value: Math.max(0, 100 - stats.best) },
+    { name: 'Saved', value: stats.best },
+    { name: 'Left', value: Math.max(0, 100 - stats.best) },
   ], [stats.best]);
 
   const handleAuth = async (e) => {
@@ -190,7 +245,13 @@ function App() {
         toast('Account created. Please sign in.');
         setAuthMode('login');
       }
-    } catch (err) { setAuthError(err.response?.data?.error || 'Authentication failed'); }
+    } catch (err) {
+      if (!err.response) {
+        setAuthError(`Cannot reach the server at ${API_BASE}. Is the backend running? (cd backend && npm start)`);
+      } else {
+        setAuthError(err.response.data?.error || 'Authentication failed');
+      }
+    }
   };
 
   const resetGoals = async () => {
@@ -198,8 +259,30 @@ function App() {
     try {
       await axios.delete(`${API_BASE}/goals`, { headers: authHeaders });
       fetchGoals();
+      fetchRewards();
+      fetchOrders();
       toast('All goals deleted.');
     } catch (err) { toast(err.response?.data?.error || 'Failed to reset goals'); }
+  };
+
+  const deleteGoal = async (goalId) => {
+    if (!window.confirm(`Delete goal #${goalId}? Its spending and rewards go too.`)) return;
+    try {
+      await axios.delete(`${API_BASE}/goals/${goalId}`, { headers: authHeaders });
+      fetchGoals();
+      fetchRewards();
+      fetchOrders();
+      toast('Goal deleted.');
+    } catch (err) { toast(err.response?.data?.error || 'Could not delete goal'); }
+  };
+
+  const resetGoalRewards = async (goalId) => {
+    if (!window.confirm(`Clear all rewards for goal #${goalId}? The goal itself stays.`)) return;
+    try {
+      const res = await axios.delete(`${API_BASE}/goals/${goalId}/rewards`, { headers: authHeaders });
+      fetchRewards();
+      toast(res.data.message || 'Rewards cleared.');
+    } catch (err) { toast(err.response?.data?.error || 'Could not clear rewards'); }
   };
 
   const windowDays = goalWindow === 'month' ? 30 : 7;
@@ -215,7 +298,7 @@ function App() {
       }, { headers: authHeaders });
       setGoalForm({ amount_limit: '', start_date: todayStr() });
       fetchGoals();
-      toast(`Savings goal created · ${windowDays}-day window.`);
+      toast(`Goal saved · you have ${windowDays} days.`);
     } catch (err) { toast(err.response?.data?.error || 'Failed to create goal'); }
   };
 
@@ -225,9 +308,9 @@ function App() {
       const earned = res.data.rewards || [];
       const score = res.data.saver_score;
       if (earned.length) {
-        toast(`Goal complete! Saver score ${score}% · Rewards: ${earned.map((r) => r.reward_item).join(', ')}`);
+        toast(`Goal done! You saved ${score}% · Rewards: ${earned.map((r) => r.reward_item).join(', ')}`);
       } else {
-        toast(`Goal complete. Saver score ${score}% — no rewards this time. Spend less next window.`);
+        toast(`Goal done. You saved ${score}% — no rewards this time. Spend less next time.`);
       }
       fetchGoals();
       fetchRewards();
@@ -254,7 +337,7 @@ function App() {
   const milestoneName = (pct) => (MILESTONES.find((m) => m.pct === pct)?.name || `${pct}% reward`);
 
   const checkout = async () => {
-    if (!activeGoalId) return toast('Select a goal to link this purchase.');
+    if (!activeGoalId) return toast('Pick a goal first, then buy.');
     const gid = Number(activeGoalId);
     const goalBefore = goals.find((g) => String(g.id) === String(gid));
     const limit = Number(goalBefore?.amount_limit) || 0;
@@ -264,7 +347,7 @@ function App() {
       const deducted = Number(res.data.totalAmount) || 0;
       const spentAfter = spentBefore + deducted;
       const pctAfter = limit > 0 ? (spentAfter / limit) * 100 : 0;
-      // Saver score AFTER this purchase: what finishing right now would bank.
+      // What you saved AFTER this buy: what finishing right now would give you.
       const saverAfter = Math.max(0, 100 - pctAfter);
       const onTrack = [25, 50, 75, 100].filter((cp) => saverAfter >= cp);
       const nextCp = [25, 50, 75, 100].find((cp) => cp > saverAfter) || null;
@@ -279,13 +362,14 @@ function App() {
       setCart([]);
       await fetchGoals();
       await fetchRewards();
+      await fetchOrders();
       if (res.data.goal_expired) {
         const rw = res.data.expiry_rewards || [];
         toast(rw.length
-          ? `Window closed on checkout! Goal completed · Rewards: ${rw.map((r) => r.reward_item).join(', ')}`
-          : 'Window closed on checkout — goal completed.');
+          ? `Time's up on this buy! Goal done · Rewards: ${rw.map((r) => r.reward_item).join(', ')}`
+          : `Time's up on this buy — goal done.`);
       } else {
-        toast(`Payment successful · saver score ${saverAfter.toFixed(0)}%. Timeline +1 day.`);
+        toast(`Bought! You saved ${saverAfter.toFixed(0)}%. +1 day passed.`);
       }
     } catch (err) { toast(err.response?.data?.error || 'Checkout failed'); }
   };
@@ -301,14 +385,14 @@ function App() {
       if (res.data.expired) {
         const rw = res.data.rewards || [];
         toast(rw.length
-          ? `Window closed! Goal #${goal.id} completed · Saver ${res.data.saver_score}% · Rewards: ${rw.map((r) => r.reward_item).join(', ')}`
-          : `Window closed — goal #${goal.id} completed with saver score ${res.data.saver_score}%.`);
+          ? `Time's up! Goal #${goal.id} done · You saved ${res.data.saver_score}% · Rewards: ${rw.map((r) => r.reward_item).join(', ')}`
+          : `Time's up — goal #${goal.id} done. You saved ${res.data.saver_score}%.`);
       } else {
-        toast(`Goal #${goal.id} timeline advanced by ${days} day${days === 1 ? '' : 's'}.`);
+        toast(`Goal #${goal.id} +${days} day${days === 1 ? '' : 's'} passed.`);
       }
       fetchGoals();
       fetchRewards();
-    } catch (err) { toast(err.response?.data?.error || 'Failed to advance timeline'); }
+    } catch (err) { toast(err.response?.data?.error || 'Could not move time. Try again.'); }
   };
 
   const createCircle = async (e) => {
@@ -443,7 +527,7 @@ function App() {
   const cartTotal = cart.reduce((s, it) => s + Number(it.price) * Number(it.quantity), 0);
   const username = user?.username || 'there';
   const initial = (username[0] || 'U').toUpperCase();
-  const themeClass = currentPage === 'dashboard' ? 'theme-dashboard' : currentPage === 'shop' ? 'theme-shop' : 'theme-social';
+  const themeClass = currentPage === 'dashboard' ? 'theme-dashboard' : currentPage === 'shop' ? 'theme-shop' : currentPage === 'report' ? 'theme-report' : 'theme-social';
 
   if (!token) {
     return (
@@ -496,12 +580,13 @@ function App() {
           <div className="logo-mark">₹</div>
           <div>
             <div className="logo-name">5thSave</div>
-            <div className="logo-sub">Invest · Save · Grow</div>
+            <div className="logo-sub">Buy · Save · Earn</div>
           </div>
         </div>
         <nav className="nav">
           <button className={`nav-btn ${currentPage === 'dashboard' ? 'active' : ''}`} onClick={() => setCurrentPage('dashboard')}>Dashboard</button>
-          <button className={`nav-btn ${currentPage === 'shop' ? 'active' : ''}`} onClick={() => setCurrentPage('shop')}>Shop</button>
+          <button className={`nav-btn ${currentPage === 'shop' ? 'active' : ''}`} onClick={() => setCurrentPage('shop')}>Buy</button>
+          <button className={`nav-btn ${currentPage === 'report' ? 'active' : ''}`} onClick={() => setCurrentPage('report')}>Report</button>
           <button className={`nav-btn ${currentPage === 'social' ? 'active' : ''}`} onClick={() => setCurrentPage('social')}>Circles</button>
         </nav>
         <div className="search-pill">⌕ &nbsp;Search goals, products, circles…</div>
@@ -545,15 +630,15 @@ function App() {
       {!joinToken && currentPage === 'dashboard' && (
         <>
           <div className="page-head">
-            <h2 className="page-title">Hi {username}, your savings portfolio</h2>
-            <p className="page-sub">Limits, milestones and rewards — styled like your investments.</p>
+            <h2 className="page-title">Hi {username}, your savings</h2>
+            <p className="page-sub">Set limits, save money and win rewards.</p>
           </div>
 
           <div className="portfolio-card">
             <div className="portfolio-balance">
               <div className="k">Total budget limit</div>
               <div className="v">{inr(stats.totalLimit)}</div>
-              <div className="s">▲ Best milestone {stats.best}% · {stats.count} rewards</div>
+              <div className="s">★ Best saving {stats.best}% · {stats.count} rewards</div>
             </div>
             <div className="portfolio-split">
               <div className="split-cell">
@@ -578,8 +663,8 @@ function App() {
           <div className="layout-2">
             <section className="card">
               <div className="card-head">
-                <h3>Holdings · {goals.length} goals</h3>
-                <button onClick={resetGoals} className="link-btn" style={{ color: '#b42318' }}>Exit all</button>
+                <h3>My goals · {goals.length}</h3>
+                <button onClick={resetGoals} className="link-btn" style={{ color: '#b42318' }}>Delete all</button>
               </div>
               <div className="card-body">
                 <form onSubmit={createGoal} className="form-row">
@@ -588,7 +673,7 @@ function App() {
                     <input className="input" type="number" min="1" placeholder="e.g. 25,000" value={goalForm.amount_limit} onChange={(e) => setGoalForm({ ...goalForm, amount_limit: e.target.value })} required />
                   </div>
                   <div className="field">
-                    <label>Window</label>
+                    <label>Time</label>
                     <div className="seg">
                       {WINDOWS.map((w) => (
                         <button key={w.id} type="button" className={`seg-btn ${goalWindow === w.id ? 'active' : ''}`} onClick={() => setGoalWindow(w.id)}>
@@ -603,10 +688,10 @@ function App() {
                   </div>
                   <div className="field">
                     <label>&nbsp;</label>
-                    <button type="submit" className="btn">Invest</button>
+                    <button type="submit" className="btn">Save</button>
                   </div>
                 </form>
-                <div className="window-hint">{windowDays}-day window · ends {fmtDate(goalEndPreview)}</div>
+                <div className="window-hint">{windowDays}-day goal · ends {fmtDate(goalEndPreview)}</div>
 
                 <div className="goal-list">
                   {goals.map((g) => {
@@ -614,8 +699,8 @@ function App() {
                     const limit = Number(g.amount_limit) || 0;
                     const dep = limit > 0 ? (spent / limit) * 100 : 0;
                     const saver = Math.max(0, 100 - dep);
-                    // Saver meter: fill = saver score, ticks sit exactly on the
-                    // 25/50/75 reward checkpoints.
+                    // Save bar: fill = what you saved, ticks sit exactly on the
+                    // 25/50/75 reward levels.
                     const savCls = saver >= 50 ? 'low' : saver >= 25 ? 'mid' : saver > 0 ? 'high' : 'over';
                     const left = limit - spent;
                     return (
@@ -638,31 +723,33 @@ function App() {
                         </div>
                         <div className="holding-right">
                           <div className="holding-amt">{inr(limit)}</div>
-                          <div className={`holding-pnl ${saver >= 50 ? 'up' : 'flat'}`}>{saver.toFixed(0)}% saver score</div>
+                          <div className={`holding-pnl ${saver >= 50 ? 'up' : 'flat'}`}>{saver.toFixed(0)}% saved</div>
                           <div style={{ display: 'flex', gap: 6, marginTop: 8, justifyContent: 'flex-end' }}>
-                            <button className="mini-btn primary" onClick={() => { setActiveGoalId(String(g.id)); setCurrentPage('shop'); }}>Shop</button>
-                            {g.status === 'active' && <button className="mini-btn" onClick={() => endGoal(g.id)}>Complete</button>}
+                            <button className="mini-btn primary" onClick={() => { setActiveGoalId(String(g.id)); setCurrentPage('shop'); }}>Buy</button>
+                            {g.status === 'active' && <button className="mini-btn" onClick={() => endGoal(g.id)}>Finish</button>}
+                            {g.status !== 'active' && <button className="mini-btn" onClick={() => resetGoalRewards(g.id)}>Clear rewards</button>}
+                            <button className="mini-btn danger" onClick={() => deleteGoal(g.id)}>Delete</button>
                           </div>
                           {g.status === 'active' && (
                             <div className="skip-row">
                               <span>Time:</span>
-                              <button className="mini-btn skip-btn" title="Advance timeline by 1 day" onClick={() => skipTime(g, 'day', 1)}>+1d</button>
-                              <button className="mini-btn skip-btn" title="Advance timeline by 7 days" onClick={() => skipTime(g, 'week', 7)}>+7d</button>
-                              <button className="mini-btn skip-btn" title="Advance timeline by 30 days" onClick={() => skipTime(g, 'month', 30)}>+30d</button>
+                              <button className="mini-btn skip-btn" title="Move 1 day forward" onClick={() => skipTime(g, 'day', 1)}>+1d</button>
+                              <button className="mini-btn skip-btn" title="Move 7 days forward" onClick={() => skipTime(g, 'week', 7)}>+7d</button>
+                              <button className="mini-btn skip-btn" title="Move 30 days forward" onClick={() => skipTime(g, 'month', 30)}>+30d</button>
                             </div>
                           )}
                         </div>
                       </div>
                     );
                   })}
-                  {goals.length === 0 && <div className="empty">No holdings yet. Add your first goal above — like your first SIP.</div>}
+                  {goals.length === 0 && <div className="empty">No goals yet. Add one above to start saving.</div>}
                 </div>
               </div>
             </section>
 
             <section className="card">
               <div className="card-head">
-                <h3>Returns &amp; rewards</h3>
+                <h3>My rewards</h3>
                 <a>View all</a>
               </div>
               <div className="card-body">
@@ -679,8 +766,8 @@ function App() {
                 </div>
 
                 <div className="chart-box">
-                  <h4>Savings distribution</h4>
-                  <p>Milestone achievement vs remaining.</p>
+                  <h4>You saved</h4>
+                  <p>Saved vs what is left.</p>
                   <div style={{ height: 180 }}>
                     <ResponsiveContainer width="100%" height="100%">
                       <PieChart>
@@ -728,7 +815,7 @@ function App() {
         <>
           <div className="page-head">
             <h2 className="page-title">Explore products</h2>
-            <p className="page-sub">Like a watchlist — link a goal, add to cart, place order.</p>
+            <p className="page-sub">Pick a goal, add items to your cart, then buy.</p>
           </div>
 
           <div className="layout-shop">
@@ -754,9 +841,9 @@ function App() {
                   })}
                 </div>
                 <div className="field">
-                  <label>Linked savings goal (folio)</label>
+                  <label>Use goal</label>
                   <select className="select" value={activeGoalId} onChange={(e) => setActiveGoalId(e.target.value)}>
-                    <option value="">Select folio</option>
+                    <option value="">Select goal</option>
                     {goals.filter((g) => g.status === 'active').map((g) => (
                       <option key={g.id} value={g.id}>Goal #{g.id} · {inr(g.amount_limit)}</option>
                     ))}
@@ -770,18 +857,18 @@ function App() {
                         <div className="instrument-name">{p.name}</div>
                       </div>
                       <div className="instrument-price">{inr(p.price)}</div>
-                      <div className="instrument-sub">Live price · Qty available</div>
+                      <div className="instrument-sub">Ready to buy</div>
                       <button className="btn secondary block" onClick={() => addToCart(p.id)}>Buy now</button>
                     </div>
                   ))}
-                  {products.length === 0 && <div className="empty">No instruments available.</div>}
+                  {products.length === 0 && <div className="empty">No items here yet.</div>}
                 </div>
               </div>
             </section>
 
             <aside className="card cart-panel">
               <div className="card-head">
-                <h3>Order · ({cart.length})</h3>
+                <h3>Cart · ({cart.length})</h3>
               </div>
               <div className="card-body">
                 {cart.length ? (
@@ -795,8 +882,8 @@ function App() {
                         </span>
                       </div>
                     ))}
-                    <div className="cart-total"><span>Payable</span><span>{inr(cartTotal)}</span></div>
-                    <button className="btn block" onClick={checkout}>Place order</button>
+                    <div className="cart-total"><span>Total</span><span>{inr(cartTotal)}</span></div>
+                    <button className="btn block" onClick={checkout}>Buy</button>
                   </>
                 ) : <div className="empty">Your cart is empty.</div>}
 
@@ -806,9 +893,9 @@ function App() {
                   const savCls = sav >= 50 ? 'low' : sav >= 25 ? 'mid' : sav > 0 ? 'high' : 'over';
                   return (
                     <div className="spotlight">
-                      <div className="spot-label">Payment complete · Goal #{spotlight.goalId}</div>
+                      <div className="spot-label">Bought · Goal #{spotlight.goalId}</div>
                       <div className="spot-amt">−{inr(spotlight.deducted)}</div>
-                      <div className="spot-sub">deducted · saver score {spotlight.saverAfter.toFixed(1)}% ({spotlight.pctAfter.toFixed(1)}% of {inr(spotlight.limit)} used)</div>
+                      <div className="spot-sub">spent · you saved {spotlight.saverAfter.toFixed(1)}% ({spotlight.pctAfter.toFixed(1)}% of {inr(spotlight.limit)} used)</div>
                       <div className={`deplete ${savCls}`}>
                         <div className="deplete-fill" style={{ width: `${Math.min(sav, 100)}%` }} />
                         {[25, 50, 75].map((t) => (
@@ -825,7 +912,7 @@ function App() {
                         </div>
                       ) : (
                         <div className="spot-next">
-                          Over budget — finish the goal to reset, or spend less next window.
+                          Over budget — finish the goal and try again, or spend less next time.
                         </div>
                       )}
                       {spotlight.next && (
@@ -834,7 +921,7 @@ function App() {
                         </div>
                       )}
                       {spotGoal?.start_date && (
-                        <div className="spot-time">Timeline +1 day · goal active since {fmtDate(spotGoal.start_date)}</div>
+                        <div className="spot-time">+1 day passed · goal started {fmtDate(spotGoal.start_date)}</div>
                       )}
                     </div>
                   );
@@ -842,14 +929,14 @@ function App() {
 
                 {receipt && (
                   <div className="receipt">
-                    <h4>Receipt · Order #{receipt.orderId}</h4>
+                    <h4>Bill · #{receipt.orderId}</h4>
                     {receipt.receipt.map((item, i) => (
                       <div key={i} className="receipt-row"><span>{item.name} × {item.quantity}</span><span>{inr(item.price * item.quantity)}</span></div>
                     ))}
                     <div className="receipt-row" style={{ fontWeight: 700, borderTop: '1px solid var(--border)', marginTop: 6, paddingTop: 8 }}>
                       <span>Total paid</span><span>{inr(receipt.totalAmount)}</span>
                     </div>
-                    <button className="mini-btn" style={{ width: '100%', marginTop: 10 }} onClick={closeReceipt}>Close receipt</button>
+                    <button className="mini-btn" style={{ width: '100%', marginTop: 10 }} onClick={closeReceipt}>Close</button>
                   </div>
                 )}
               </div>
@@ -858,17 +945,139 @@ function App() {
         </>
       )}
 
+      {!joinToken && currentPage === 'report' && (
+        <>
+          <div className="page-head">
+            <h2 className="page-title">Spending report</h2>
+            <p className="page-sub">Where your money went, and what you saved.</p>
+          </div>
+
+          <div className="portfolio-card">
+            <div className="portfolio-balance">
+              <div className="k">Total saved</div>
+              <div className="v">{inr(report.totalSaved)}</div>
+              <div className="s">★ {report.savedPct.toFixed(0)}% of all limits saved</div>
+            </div>
+            <div className="portfolio-split">
+              <div className="split-cell">
+                <div className="k">Limits</div>
+                <div className="v">{inr(report.totalLimit)}</div>
+              </div>
+              <div className="split-cell">
+                <div className="k">Spent</div>
+                <div className="v">{inr(report.totalSpent)}</div>
+              </div>
+              <div className="split-cell">
+                <div className="k">Rewards</div>
+                <div className="v">{rewards.length}</div>
+              </div>
+              <div className="split-cell">
+                <div className="k">Went most on</div>
+                <div className="v" style={{ fontSize: 18 }}>{report.topCat ? report.topCat.name : '—'}</div>
+              </div>
+            </div>
+          </div>
+
+          {(goals.length === 0 && orders.length === 0) ? (
+            <div className="card"><div className="card-body"><div className="empty">Nothing to report yet. Set a goal and buy something first.</div></div></div>
+          ) : (
+          <div className="layout-2">
+            <section className="card">
+              <div className="card-head">
+                <h3>Where it went the most</h3>
+                <p>By shop category</p>
+              </div>
+              <div className="card-body">
+                {report.catRows.length ? (
+                  <>
+                    <div style={{ height: 200 }}>
+                      <ResponsiveContainer width="100%" height="100%">
+                        <PieChart>
+                          <Pie data={report.catRows} dataKey="value" nameKey="name" innerRadius={55} outerRadius={80} paddingAngle={3} strokeWidth={1} stroke="#e5e7eb">
+                            {report.catRows.map((_, i) => <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />)}
+                          </Pie>
+                          <Tooltip formatter={(v) => inr(v)} />
+                        </PieChart>
+                      </ResponsiveContainer>
+                    </div>
+                    <table className="table">
+                      <thead><tr><th>#</th><th>Category</th><th style={{ textAlign: 'right' }}>Spent</th><th style={{ textAlign: 'right' }}>Share</th></tr></thead>
+                      <tbody>
+                        {report.catRows.map((c, i) => (
+                          <tr key={c.name}>
+                            <td>{i + 1}</td>
+                            <td><span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 3, background: PIE_COLORS[i % PIE_COLORS.length], marginRight: 8 }} />{c.name}{i === 0 ? ' ★ most' : ''}</td>
+                            <td style={{ textAlign: 'right' }}>{inr(c.value)}</td>
+                            <td style={{ textAlign: 'right' }}>{c.share.toFixed(1)}%</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    <p style={{ fontSize: 12.5, color: '#7c7e8c', margin: '8px 2px 0' }}>Counted from Buy page purchases only.</p>
+                  </>
+                ) : <div className="empty">No purchases yet — categories show up after your first buy.</div>}
+              </div>
+            </section>
+
+            <section className="card">
+              <div className="card-head">
+                <h3>Saving by goal</h3>
+                <p>Spent vs saved</p>
+              </div>
+              <div className="card-body">
+                {report.perGoal.length ? (
+                  <>
+                    <div style={{ height: 180 }}>
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={report.byGoal.map((g) => ({ name: `#${g.id}`, Spent: g.spent, Saved: Math.max(0, g.saved) }))}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" vertical={false} />
+                          <XAxis dataKey="name" tick={{ fontSize: 11 }} axisLine={false} tickLine={false} />
+                          <YAxis tick={{ fontSize: 11 }} width={44} axisLine={false} tickLine={false} />
+                          <Tooltip formatter={(v) => inr(v)} />
+                          <Bar dataKey="Spent" fill="#eb5b47" radius={[6, 6, 2, 2]} />
+                          <Bar dataKey="Saved" fill="#00b386" radius={[6, 6, 2, 2]} />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                    <table className="table">
+                      <thead><tr><th>Goal</th><th style={{ textAlign: 'right' }}>Limit</th><th style={{ textAlign: 'right' }}>Spent</th><th style={{ textAlign: 'right' }}>Saved</th><th style={{ textAlign: 'right' }}>Saved %</th><th style={{ textAlign: 'right' }}>Rewards</th></tr></thead>
+                      <tbody>
+                        {report.byGoal.map((g) => (
+                          <tr key={g.id}>
+                            <td>#{g.id} · {g.status}</td>
+                            <td style={{ textAlign: 'right' }}>{inr(g.limit)}</td>
+                            <td style={{ textAlign: 'right' }}>{inr(g.spent)}</td>
+                            <td style={{ textAlign: 'right' }}>{inr(g.saved)}</td>
+                            <td style={{ textAlign: 'right' }}>{g.pct.toFixed(0)}%</td>
+                            <td style={{ textAlign: 'right' }}>{g.rewards}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {report.topGoal && report.topGoal.spent > 0 && (
+                      <p style={{ fontSize: 13, margin: '10px 2px 0' }}>Most spending: <strong>goal #{report.topGoal.id} ({inr(report.topGoal.spent)})</strong>
+                      {report.bestGoal && <span> · Best saver: <strong>goal #{report.bestGoal.id} ({report.bestGoal.pct.toFixed(0)}% saved)</strong></span>}</p>
+                    )}
+                  </>
+                ) : <div className="empty">No goals yet.</div>}
+              </div>
+            </section>
+          </div>
+          )}
+        </>
+      )}
+
       {!joinToken && currentPage === 'social' && (
         <>
           <div className="page-head">
-            <h2 className="page-title">Circles watchlist</h2>
-            <p className="page-sub">Your groups, ranked like top gainers.</p>
+            <h2 className="page-title">My circles</h2>
+            <p className="page-sub">Your groups — see who saved the most.</p>
           </div>
 
           <div className="layout-2">
             <section className="card">
               <div className="card-head">
-                <h3>Watchlist · {circles.length}</h3>
+                <h3>Circles · {circles.length}</h3>
               </div>
               <div className="card-body">
                 <form onSubmit={createCircle} style={{ display: 'flex', gap: 8 }}>
@@ -894,14 +1103,14 @@ function App() {
                       {c.is_creator && <button className="mini-btn danger" onClick={() => deleteCircle(c)}>Delete</button>}
                     </div>
                   ))}
-                  {circles.length === 0 && <div className="empty">Empty watchlist. Create a circle or join with a code.</div>}
+                  {circles.length === 0 && <div className="empty">No circles yet. Make one or join with a link.</div>}
                 </div>
               </div>
             </section>
 
             <section className="card">
               <div className="card-head">
-                <h3>Top gainers</h3>
+                <h3>Top savers</h3>
                 <p>{activeBoard ? `Circle #${activeBoard}` : 'Select a circle'}</p>
               </div>
               <div className="card-body">
