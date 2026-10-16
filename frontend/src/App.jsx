@@ -350,14 +350,17 @@ function App() {
       // What you saved AFTER this buy: what finishing right now would give you.
       const saverAfter = Math.max(0, 100 - pctAfter);
       const onTrack = [25, 50, 75, 100].filter((cp) => saverAfter >= cp);
-      const nextCp = [25, 50, 75, 100].find((cp) => cp > saverAfter) || null;
+      // Level at risk: the highest reward level still secured. Spending more
+      // can only LOWER the saver score, so the useful hint is the spending cap
+      // that keeps this level — not "spend more to reach" a higher one.
+      const atRisk = onTrack.length ? onTrack[onTrack.length - 1] : null;
       setReceipt(res.data);
       setSpotlight({
         goalId: gid,
         deducted, limit, spentAfter, pctAfter, saverAfter,
         claimed: (res.data.expiry_rewards || []).map((r) => ({ pct: Number(r.checkpoint_percentage), name: r.reward_item })),
         onTrack: onTrack.map((cp) => ({ pct: cp, name: milestoneName(cp) })),
-        next: nextCp ? { pct: nextCp, name: milestoneName(nextCp), headroom: Math.max(0, (1 - nextCp / 100) * limit - spentAfter) } : null,
+        next: atRisk != null ? { pct: atRisk, name: milestoneName(atRisk), cap: limit * (1 - atRisk / 100) } : null,
       });
       setCart([]);
       await fetchGoals();
@@ -917,7 +920,7 @@ function App() {
                       )}
                       {spotlight.next && (
                         <div className="spot-next">
-                          Spend {inr(spotlight.next.headroom)} more at most to reach {spotlight.next.name} ({spotlight.next.pct}%)
+                          Keep total spending under {inr(spotlight.next.cap)} to keep {spotlight.next.name} ({spotlight.next.pct}%)
                         </div>
                       )}
                       {spotGoal?.start_date && (

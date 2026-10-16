@@ -267,8 +267,11 @@ app.post('/goals/:id/end', authenticateToken, async (req, res) => {
     return res.status(400).json({ error: 'Valid goal id is required' });
   }
   try {
-    const goalCheck = await db.query('SELECT id FROM savings_goals WHERE id = $1 AND user_id = $2', [goalId, req.user.id]);
+    const goalCheck = await db.query('SELECT id, status FROM savings_goals WHERE id = $1 AND user_id = $2', [goalId, req.user.id]);
     if (goalCheck.rows.length === 0) return res.status(403).json({ error: 'Goal not found or not yours' });
+    if (goalCheck.rows[0].status !== 'active') {
+      return res.status(400).json({ error: 'Goal is already finished — its rewards were already decided.' });
+    }
 
     const result = await db.query("UPDATE savings_goals SET status = 'completed' WHERE id = $1 RETURNING *", [goalId]);
     const goal = result.rows[0];
