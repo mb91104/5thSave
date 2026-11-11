@@ -1,5 +1,5 @@
-// Local simulation of Vercel routing for deployment tests:
-//   /api, /api/*  -> the Serverless Function (rewrite keeps the original path)
+// Local simulation of Vercel Services routing for deployment tests:
+//   /api, /api/*  -> the Express backend service (original path preserved)
 //   everything else -> frontend/dist with SPA fallback
 // This is only used by tests/deploy.sh; Vercel does this itself in production.
 const http = require('http');
@@ -8,7 +8,7 @@ const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
 const DIST = path.join(ROOT, 'frontend', 'dist');
-const api = require('../api/index.js');
+const backend = require('../backend/index.js');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -22,7 +22,7 @@ const MIME = {
 
 const server = http.createServer((req, res) => {
   if (req.url === '/api' || req.url.startsWith('/api/')) {
-    return api(req, res);
+    return backend(req, res);
   }
 
   const pathname = decodeURIComponent(req.url.split('?')[0]);
@@ -34,7 +34,7 @@ const server = http.createServer((req, res) => {
     return fs.createReadStream(candidate).pipe(res);
   }
 
-  // SPA fallback, matching the vercel.json rewrite.
+  // SPA fallback, matching the frontend service rewrite in vercel.json.
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   if (req.method === 'HEAD') return res.end();
   return fs.createReadStream(path.join(DIST, 'index.html')).pipe(res);
@@ -42,5 +42,5 @@ const server = http.createServer((req, res) => {
 
 const PORT = Number(process.env.PORT || 4567);
 server.listen(PORT, () => {
-  console.log(`Vercel simulation listening on http://127.0.0.1:${PORT}`);
+  console.log(`Vercel Services simulation listening on http://127.0.0.1:${PORT}`);
 });

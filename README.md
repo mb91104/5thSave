@@ -48,11 +48,18 @@ backend uses another port, set `VITE_DEV_API_URL` in `frontend/.env` (see
 
 ## ▲ Deploying to Vercel
 
-The repository is a single Vercel project:
+This repository deploys as a single Vercel **Services** project. Vercel detects
+the separate frontend and backend apps, so `vercel.json` declares both services
+and the public routing between them.
 
-- `frontend/dist` is served statically with an SPA fallback (`/join/:token` works on refresh).
-- `api/index.js` runs the Express app as a single Vercel Function; `/api/*` is rewritten to it.
-- `backend/index.js` exports the app and only binds a port when run directly.
+| Service | Root | Framework | Behavior |
+| --- | --- | --- | --- |
+| `frontend` | `frontend/` | Vite | Builds to `dist/`; serves the SPA with a `/index.html` fallback |
+| `backend` | `backend/` | Express | Runs `backend/index.js` as a Vercel Function |
+
+Top-level rewrites send `/api` and `/api/*` to `backend`; every other path goes
+to `frontend`. Services receive the original path, so `backend/index.js` keeps
+its `/api` prefix-stripping middleware.
 
 ### Steps
 
@@ -63,8 +70,10 @@ The repository is a single Vercel project:
    ```bash
    DATABASE_URL='postgres://...' npm run db:init
    ```
-3. **Import the repo into Vercel.** `vercel.json` sets the install, build, and
-   output settings automatically — no dashboard build overrides needed.
+3. **Import the repo into Vercel** with the **repository root** as the Root
+   Directory (not `backend` or `frontend`). If the import screen asks for a
+   framework, choose **Services**; `vercel.json` supplies the per-service
+   install/build settings.
 4. **Set environment variables** in Project → Settings → Environment Variables:
    | Variable | Required | Notes |
    | --- | --- | --- |
@@ -84,8 +93,8 @@ npm run test:deploy  # production build + Vercel-style /api routing + SPA fallba
 ```
 
 `test:deploy` builds the frontend, serves `frontend/dist` with the same SPA
-fallback as Vercel, and routes `/api/*` through the actual Serverless Function
-entry point.
+fallback as the Vercel frontend service, and routes `/api/*` through the actual
+Express backend service.
 
 ### Notes
 

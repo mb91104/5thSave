@@ -17,8 +17,8 @@ if (!process.env.JWT_SECRET) {
 
 const app = express();
 
-// On Vercel this same app is served from /api/* (see backend/vercel-handler.js).
-// Locally it runs at the root, so strip the prefix when it is present.
+// On Vercel the backend service receives the original /api/* path (see
+// vercel.json). Locally it runs at the root, so strip the prefix when present.
 app.use((req, _res, next) => {
   if (req.url === '/api' || req.url.startsWith('/api/')) {
     req.url = req.url.slice(4) || '/';
@@ -864,7 +864,7 @@ app.use((req, res) => {
 const PORT = process.env.PORT || 3000;
 
 // Only bind a port when run directly (`node index.js`). Vercel imports the app
-// through api/index.js and owns the HTTP server itself.
+// as a service and owns the HTTP server itself.
 if (require.main === module) {
   const server = app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
