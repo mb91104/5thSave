@@ -37,10 +37,13 @@
   --page-bg: #E3EAF6; --page-glow: rgba(59, 89, 152, 0.18);
 }
 
-body:has(.theme-dashboard) { background: radial-gradient(900px 300px at 50% -80px, var(--page-glow), transparent 70%), linear-gradient(180deg, var(--page-bg), #f7f8f7 55%, #f4f5f7); }
-body:has(.theme-shop) { background: radial-gradient(900px 300px at 50% -80px, var(--page-glow), transparent 70%), linear-gradient(180deg, var(--page-bg), #fbf8f3 55%, #f4f5f7); }
-body:has(.theme-social) { background: radial-gradient(900px 300px at 50% -80px, var(--page-glow), transparent 70%), linear-gradient(180deg, var(--page-bg), #f5f7fc 55%, #f4f5f7); }
-body:has(.theme-report) { background: radial-gradient(900px 300px at 50% -80px, var(--page-glow), transparent 70%), linear-gradient(180deg, var(--page-bg), #f2f6fd 55%, #f4f5f7); }
+/* These rules target <body>, so they cannot read the --page-* variables
+   declared on .app. Use literal values or the whole declaration is dropped
+   and the page keeps the default white background. */
+body:has(.theme-dashboard) { background: radial-gradient(900px 300px at 50% -80px, rgba(122, 132, 80, 0.16), transparent 70%), linear-gradient(180deg, #E4E1D4, #f7f8f7 55%, #f4f5f7); }
+body:has(.theme-shop) { background: radial-gradient(900px 300px at 50% -80px, rgba(232, 146, 43, 0.16), transparent 70%), linear-gradient(180deg, #F4E9C9, #fbf8f3 55%, #f4f5f7); }
+body:has(.theme-social) { background: radial-gradient(900px 300px at 50% -80px, rgba(124, 134, 168, 0.20), transparent 70%), linear-gradient(180deg, #E2DEF0, #f5f7fc 55%, #f4f5f7); }
+body:has(.theme-report) { background: radial-gradient(900px 300px at 50% -80px, rgba(59, 89, 152, 0.18), transparent 70%), linear-gradient(180deg, #E3EAF6, #f2f6fd 55%, #f4f5f7); }
 
 /* Groww-style full-bleed header */
 .topbar {
@@ -273,7 +276,108 @@ body:has(.theme-report) { background: radial-gradient(900px 300px at 50% -80px, 
 .auth-wrap { min-height: 100vh; display: grid; place-items: center; padding: 24px; align-content: center; gap: 14px; }
 .invite-banner { text-align: center; border-color: var(--accent-line); }
 
-/* Share sheet (invite links) */
+/* Landing page */
+.landing {
+  display: flex;
+  min-height: 100vh;
+  background: var(--page-bg);
+  color: var(--accent-ink);
+}
+.landing-content {
+  flex: 1;
+  padding: 60px 40px;
+  max-width: 600px;
+}
+.landing-content h1 {
+  font-size: 3rem;
+  margin-bottom: 0.5rem;
+}
+.landing-content h1 span {
+  color: var(--accent);
+}
+.landing-content .tagline {
+  font-size: 1.25rem;
+  margin-bottom: 1.5rem;
+  color: #555;
+}
+.landing-content .features {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 1rem;
+}
+.landing-content .features li {
+  margin-bottom: 0.5rem;
+  position: relative;
+  padding-left: 1.2rem;
+}
+.landing-content .features li::before {
+  content: '✔';
+  position: absolute;
+  left: 0;
+  color: var(--accent);
+}
+.auth-section {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 60px 40px;
+}
+.auth-section .auth-card {
+  width: 100%;
+  max-width: 380px;
+}
+.auth-section .auth-card h2 {
+  margin-top: 0;
+  margin-bottom: 1rem;
+  font-size: 1.5rem;
+  text-align: center;
+}
+
+.ascii-bg {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  pointer-events: none;
+  font-family: monospace;
+  font-size: 0.6rem;
+  line-height: 0.8rem;
+  color: var(--accent-ink);
+  opacity: 0.07;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+}
+.ascii-bg pre {
+  margin: 0;
+  transform: translateY(20%);
+}
+.landing-wrapper {
+  /* The landing page renders before `.app`, so it must define the theme
+     tokens it uses instead of relying on `.app` to supply them. Without
+     these the sign-in button had a transparent background and every
+     border disappeared. */
+  --accent: #00b386;
+  --accent-ink: #121212;
+  --accent-soft: #e6f7f0;
+  --accent-line: #b7e6d4;
+  --groww-border: #e9edf2;
+  --groww-green: #00b386;
+  --groww-red: #eb5b47;
+  --page-bg: #f6f7f9;
+  --text: #111827;
+  --muted: #6b7280;
+  position: relative;
+  overflow: hidden;
+  min-height: 100vh;
+  background: var(--page-bg);
+  color: var(--text);
+}
+
 .share-backdrop {
   position: fixed; inset: 0; z-index: 70;
   background: rgba(18, 18, 18, 0.45);
@@ -325,9 +429,117 @@ body:has(.theme-report) { background: radial-gradient(900px 300px at 50% -80px, 
   .form-row { grid-template-columns: 1fr 1fr; }
   .topbar { flex-wrap: wrap; gap: 10px; }
   .search-pill { display: none; }
+  .landing { flex-direction: column; }
+  .landing-content { max-width: none; padding: 44px 28px 12px; }
+  .auth-section { padding: 24px 28px 48px; }
 }
 @media (max-width: 560px) {
   .portfolio-split { grid-template-columns: 1fr 1fr; }
   .form-row { grid-template-columns: 1fr; }
   .milestones { grid-template-columns: repeat(2, 1fr); }
+  .landing-content h1 { font-size: 2.25rem; }
+  .landing-content, .auth-section { padding-left: 20px; padding-right: 20px; }
 }
+
+/* ===== Dark theme ===== */
+.app.theme-dark {
+  /* Keep page accents, but on dark surfaces use a brighter tone so the
+     active states and meters stay legible. */
+  --accent: #2dd4bf;
+  --accent-ink: #e6e8ee;
+  --accent-soft: #12332d;
+  --accent-line: #1f5f52;
+  --page-bg: #0f1115;
+  --page-glow: rgba(45, 212, 191, 0.10);
+  --groww-border: #2b303b;
+  --groww-green: #34d399;
+  --groww-red: #f87171;
+  color: #e6e8ee;
+  color-scheme: dark;
+}
+body:has(.theme-dark) {
+  background: radial-gradient(900px 300px at 50% -80px, rgba(45, 212, 191, 0.10), transparent 70%), linear-gradient(180deg, #0f1115, #11151b 55%, #0b0d11);
+}
+.app.theme-dark .topbar { background: #171a21; border-bottom-color: var(--groww-border); }
+.app.theme-dark .logo-sub,
+.app.theme-dark .nav-btn,
+.app.theme-dark .page-sub,
+.app.theme-dark .portfolio-balance .k,
+.app.theme-dark .split-cell .k,
+.app.theme-dark .card-head p,
+.app.theme-dark .card-head a,
+.app.theme-dark .holding-sub,
+.app.theme-dark .holding-pnl.flat,
+.app.theme-dark .seg-btn,
+.app.theme-dark .window-hint,
+.app.theme-dark .skip-row,
+.app.theme-dark .spot-next,
+.app.theme-dark .instrument-sub,
+.app.theme-dark .field label,
+.app.theme-dark .rank-num,
+.app.theme-dark .table th,
+.app.theme-dark .chart-box p,
+.app.theme-dark .mile:not(.done) .p,
+.app.theme-dark .mile .n,
+.app.theme-dark .empty,
+.app.theme-dark .share-sub,
+.app.theme-dark .join-card p { color: #a0a7b4; }
+.app.theme-dark .nav-btn.active,
+.app.theme-dark .nav-btn:hover { color: #f3f4f6; }
+.app.theme-dark .holding-name,
+.app.theme-dark .instrument-name,
+.app.theme-dark .table td,
+.app.theme-dark .cart-line,
+.app.theme-dark .receipt-row { color: #e6e8ee; }
+.app.theme-dark .spend-line,
+.app.theme-dark .spot-sub,
+.app.theme-dark .cat-pill,
+.app.theme-dark .instrument-tile,
+.app.theme-dark .watch-avatar,
+.app.theme-dark .mini-btn,
+.app.theme-dark .logout-btn { color: #c7ccd6; }
+.app.theme-dark .search-pill { background: #1b1f27; color: #a0a7b4; }
+.app.theme-dark .card,
+.app.theme-dark .portfolio-card,
+.app.theme-dark .instrument,
+.app.theme-dark .auth-card,
+.app.theme-dark .share-sheet { background: #171a21; border-color: var(--groww-border); }
+.app.theme-dark .split-cell,
+.app.theme-dark .chart-box,
+.app.theme-dark .mile,
+.app.theme-dark .empty,
+.app.theme-dark .receipt { background: #1b1f27; border-color: var(--groww-border); }
+.app.theme-dark .seg { background: #1b1f27; }
+.app.theme-dark .seg-btn.active { background: #2a303b; color: #f3f4f6; }
+.app.theme-dark .deplete,
+.app.theme-dark .mini-progress { background: #2b303b; }
+.app.theme-dark .deplete-tick { background: rgba(255, 255, 255, 0.25); }
+.app.theme-dark .spotlight { background: linear-gradient(180deg, var(--accent-soft), #171a21 85%); }
+.app.theme-dark .spot-reward { background: #12332d; border-color: var(--accent-line); color: #6ee7b7; }
+.app.theme-dark .gain-pill { background: #12332d; }
+.app.theme-dark .cat-pill { background: #1b1f27; border-color: var(--groww-border); }
+.app.theme-dark .cat-count { background: #0f1115; border-color: var(--groww-border); }
+.app.theme-dark .instrument-tile,
+.app.theme-dark .watch-avatar { background: #1f242e; }
+.app.theme-dark .holding:hover,
+.app.theme-dark .watch-row:hover,
+.app.theme-dark .mini-btn:hover,
+.app.theme-dark .logout-btn:hover,
+.app.theme-dark .share-row:hover { background: #1f242e; }
+.app.theme-dark .btn.secondary,
+.app.theme-dark .mini-btn,
+.app.theme-dark .logout-btn,
+.app.theme-dark .input,
+.app.theme-dark .select { background: #1b1f27; border-color: var(--groww-border); }
+.app.theme-dark .btn { color: #062a26; }
+.app.theme-dark .btn.secondary { color: var(--accent-ink); }
+.app.theme-dark .share-row { color: #e6e8ee; }
+.app.theme-dark .share-tile.cp { background: #1f242e; color: #c7ccd6; }
+.app.theme-dark .auth-error { background: #3b1717; border-color: #7f1d1d; color: #fca5a5; }
+.app.theme-dark .toast { background: #0b0d11; border: 1px solid var(--groww-border); color: #e6e8ee; }
+.app.theme-dark .card-head,
+.app.theme-dark .holding + .holding,
+.app.theme-dark .watch-row + .watch-row,
+.app.theme-dark .cart-line,
+.app.theme-dark .table td { border-color: var(--groww-border); }
+.app.theme-dark .input::placeholder { color: #6b7280; }

@@ -8,7 +8,7 @@ const db = require('./db');
 // Pin to backend/.env regardless of the working directory the server is started from.
 // (A second .env at the repo root has a different JWT_SECRET — loading that by
 // accident invalidates every issued token.)
-require('dotenv').config({ path: path.join(__dirname, '.env') });
+require('dotenv').config({ path: path.join(__dirname, '.env'), quiet: true });
 
 if (!process.env.JWT_SECRET) {
   console.error('FATAL: JWT_SECRET is not set. Define it in backend/.env (canonical) and restart.');
@@ -16,8 +16,34 @@ if (!process.env.JWT_SECRET) {
 }
 
 const app = express();
-app.use(cors());
+
+// On Vercel this same app is served from /api/* (see backend/vercel-handler.js).
+// Locally it runs at the root, so strip the prefix when it is present.
+app.use((req, _res, next) => {
+  if (req.url === '/api' || req.url.startsWith('/api/')) {
+    req.url = req.url.slice(4) || '/';
+  }
+  next();
+});
+
+// Same-origin deployments (the default on Vercel) do not need CORS. Set
+// CORS_ORIGIN to a comma-separated list when the frontend lives elsewhere.
+const corsOrigins = (process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+app.use(cors(corsOrigins.length ? { origin: corsOrigins } : {}));
 app.use(express.json());
+
+// Deployment health check (uptime monitors / smoke tests).
+app.get('/health', async (_req, res) => {
+  try {
+    await db.query('SELECT 1');
+    res.json({ status: 'ok', database: 'up', uptime: Math.round(process.uptime()) });
+  } catch (err) {
+    res.status(503).json({ status: 'error', database: 'down', error: err.message });
+  }
+});
 
 // Middleware to verify JWT
 const authenticateToken = (req, res, next) => {
@@ -221,7 +247,14 @@ app.post('/shop/checkout', authenticateToken, async (req, res) => {
 
     // 5. AUTOMATIC TIME SKIP (+1 day) with window-expiry check:
     // if the window elapsed, the goal auto-completes and pays rewards.
-    const expiry = await advanceClock(req.user.id, goalId, 1);
+    // The order is already committed at this point, so a clock/reward error
+    // must not turn a successful purchase into a 500 response.
+    let expiry = { expired: false };
+    try {
+      expiry = await advanceClock(req.user.id, goalId, 1);
+    } catch (clockErr) {
+      console.error('Post-checkout clock advance failed:', clockErr);
+    }
 
     res.status(201).json({
       message: 'Checkout successful!',
@@ -492,8 +525,13 @@ app.post('/shop/buy', authenticateToken, async (req, res) => {
     return res.status(400).json({ error: 'Valid goalId is required' });
   }
   try {
-    const goalCheck = await db.query('SELECT id FROM savings_goals WHERE id = $1 AND user_id = $2', [goalId, req.user.id]);
+    const goalCheck = await db.query('SELECT id, status FROM savings_goals WHERE id = $1 AND user_id = $2', [goalId, req.user.id]);
     if (goalCheck.rows.length === 0) return res.status(403).json({ error: 'Goal not found or not yours' });
+    // Match checkout: once a goal is finished its reward outcome is final,
+    // so it must not keep accepting spends.
+    if (goalCheck.rows[0].status !== 'active') {
+      return res.status(400).json({ error: 'Goal is already completed — create a new goal to keep shopping.' });
+    }
 
     const productRes = await db.query('SELECT price, name FROM products WHERE id = $1', [productId]);
     if (productRes.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
@@ -576,8 +614,13 @@ app.post('/transactions', authenticateToken, async (req, res) => {
     return res.status(400).json({ error: 'Refund amounts must be positive' });
   }
   try {
-    const goalCheck = await db.query('SELECT id FROM savings_goals WHERE id = $1 AND user_id = $2', [goalId, req.user.id]);
+    const goalCheck = await db.query('SELECT id, status FROM savings_goals WHERE id = $1 AND user_id = $2', [goalId, req.user.id]);
     if (goalCheck.rows.length === 0) return res.status(403).json({ error: 'Goal not found or not yours' });
+    // Refunds stay allowed (they restore savings); new outflows on a finished
+    // goal would rewrite a reward outcome that was already decided.
+    if (goalCheck.rows[0].status !== 'active' && value < 0) {
+      return res.status(400).json({ error: 'Goal is already completed — only refunds can be recorded.' });
+    }
     const result = await db.query(
       'INSERT INTO transaction_ledger (goal_id, amount, transaction_type, description) VALUES ($1, $2, $3, $4) RETURNING *',
       [goalId, value, transaction_type, description || null]
@@ -729,7 +772,7 @@ app.get('/leaderboard/:circleId', authenticateToken, async (req, res) => {
       JOIN circle_members cm ON cm.user_id = u.id AND cm.circle_id = $1
       LEFT JOIN (
         SELECT sg.user_id,
-               GREATEST(0, (sg.amount_limit + COALESCE(SUM(tl.amount), 0)) / NULLIF(sg.amount_limit, 0) * 100) AS saver_pct
+               LEAST(100, GREATEST(0, (sg.amount_limit + COALESCE(SUM(tl.amount), 0)) / NULLIF(sg.amount_limit, 0) * 100)) AS saver_pct
         FROM savings_goals sg
         LEFT JOIN transaction_ledger tl ON tl.goal_id = sg.id
         GROUP BY sg.id, sg.user_id, sg.amount_limit
@@ -814,5 +857,25 @@ app.get('/circles/invite/:token', async (req, res) => {
   }
 });
 
+app.use((req, res) => {
+  res.status(404).json({ error: `Not found: ${req.method} ${req.path}` });
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+// Only bind a port when run directly (`node index.js`). Vercel imports the app
+// through api/index.js and owns the HTTP server itself.
+if (require.main === module) {
+  const server = app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`FATAL: port ${PORT} is already in use. Stop the other process or set PORT in backend/.env.`);
+      process.exit(1);
+    }
+    throw err;
+  });
+}
+
+module.exports = app;

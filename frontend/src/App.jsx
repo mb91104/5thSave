@@ -6,7 +6,9 @@ import {
   Tooltip, BarChart, Bar, XAxis, YAxis, CartesianGrid
 } from 'recharts';
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+// /api works in development (Vite proxy) and on Vercel (serverless rewrite).
+// Set VITE_API_URL only for a split deployment on a different origin.
+const API_BASE = import.meta.env.VITE_API_URL || '/api';
 
 const MILESTONES = [
   { pct: 25, name: 'Flipkart Voucher' },
@@ -183,8 +185,18 @@ function App() {
     const totalSpent = goals.reduce((s, g) => s + (Number(g.total_spent) || 0), 0);
     const active = goals.filter((g) => g.status === 'active').length;
     const completed = goals.filter((g) => g.status !== 'active').length;
-    const best = rewards.length ? Math.max(...rewards.map((r) => Number(r.checkpoint_percentage))) : 0;
-    return { totalLimit, totalSpent, active, completed, best, count: rewards.length };
+    // "Best saving" is the best saver score across goals, not the highest
+    // reward checkpoint. Otherwise an active 100%-saved goal showed as 0%.
+    const best = goals.reduce((top, g) => {
+      const limit = Number(g.amount_limit) || 0;
+      if (limit <= 0) return top;
+      const spent = Number(g.total_spent) || 0;
+      return Math.max(top, Math.min(100, Math.max(0, (1 - spent / limit) * 100)));
+    }, 0);
+    const savedPct = totalLimit > 0
+      ? Math.min(100, Math.max(0, ((totalLimit - totalSpent) / totalLimit) * 100))
+      : 0;
+    return { totalLimit, totalSpent, active, completed, best: Math.round(best), savedPct, count: rewards.length };
   }, [goals, rewards]);
 
   const goalChartData = useMemo(
@@ -198,14 +210,14 @@ function App() {
       const limit = Number(g.amount_limit) || 0;
       const spent = Number(g.total_spent) || 0;
       const saved = limit - spent;
-      const pct = limit > 0 ? Math.max(0, 100 - (spent / limit) * 100) : 0;
+      const pct = limit > 0 ? Math.min(100, Math.max(0, 100 - (spent / limit) * 100)) : 0;
       const rw = rewards.filter((r) => String(r.goal_id) === String(g.id)).length;
       return { id: g.id, limit, spent, saved, pct, status: g.status, rewards: rw };
     });
     const totalLimit = perGoal.reduce((s, g) => s + g.limit, 0);
     const totalSpent = perGoal.reduce((s, g) => s + g.spent, 0);
     const totalSaved = totalLimit - totalSpent;
-    const savedPct = totalLimit > 0 ? Math.max(0, (totalSaved / totalLimit) * 100) : 0;
+    const savedPct = totalLimit > 0 ? Math.min(100, Math.max(0, (totalSaved / totalLimit) * 100)) : 0;
     // Category totals come from Buy-page purchases (orders carry the category).
     const byCat = {};
     orders.forEach((o) => {
@@ -226,10 +238,13 @@ function App() {
       bestGoal: [...perGoal].sort((a, b) => b.pct - a.pct)[0] || null,
     };
   }, [goals, rewards, orders]);
-  const savingsPie = useMemo(() => [
-    { name: 'Saved', value: stats.best },
-    { name: 'Left', value: Math.max(0, 100 - stats.best) },
-  ], [stats.best]);
+  const savingsPie = useMemo(() => {
+    const saved = Math.min(100, Math.max(0, stats.savedPct));
+    return [
+      { name: 'Saved', value: saved },
+      { name: 'Left', value: 100 - saved },
+    ];
+  }, [stats.savedPct]);
 
   const handleAuth = async (e) => {
     e.preventDefault();
@@ -416,7 +431,7 @@ function App() {
       const res = await axios.get(`${API_BASE}/circles/invite/${tok}`);
       setInvitePreview(res.data);
       setInviteStatus('ready');
-    } catch (err) {
+    } catch {
       setInvitePreview(null);
       setInviteStatus('invalid');
     }
@@ -530,47 +545,107 @@ function App() {
   const cartTotal = cart.reduce((s, it) => s + Number(it.price) * Number(it.quantity), 0);
   const username = user?.username || 'there';
   const initial = (username[0] || 'U').toUpperCase();
-  const themeClass = currentPage === 'dashboard' ? 'theme-dashboard' : currentPage === 'shop' ? 'theme-shop' : currentPage === 'report' ? 'theme-report' : 'theme-social';
+  const [darkMode, setDarkMode] = useState(() => localStorage.getItem('darkMode') === 'true');
+  const toggleDark = () => {
+    const newVal = !darkMode;
+    setDarkMode(newVal);
+    localStorage.setItem('darkMode', newVal);
+  };
+  const themeClass = `${darkMode ? 'theme-dark' : ''} ${currentPage === 'dashboard' ? 'theme-dashboard' : currentPage === 'shop' ? 'theme-shop' : currentPage === 'report' ? 'theme-report' : 'theme-social'}`.trim();
 
   if (!token) {
     return (
-      <div className="auth-wrap">
-        {joinToken && (
-          <div className="auth-card invite-banner">
-            {inviteStatus === 'loading' && <p className="muted">Checking invite link…</p>}
-            {inviteStatus === 'ready' && invitePreview && (
-              <>
-                <h1 style={{ fontSize: 20 }}>{invitePreview.inviter ? `${invitePreview.inviter} invited you` : 'You were invited'} to join</h1>
-                <p className="muted" style={{ marginBottom: 0 }}>“{invitePreview.circle_name}” · {invitePreview.member_count} member{invitePreview.member_count === 1 ? '' : 's'} — sign in below to accept.</p>
-              </>
-            )}
-            {inviteStatus === 'invalid' && <div className="auth-error">This invite link is invalid or expired.</div>}
+      <div className="landing-wrapper">
+        <div className="ascii-bg">
+          <pre>
+{`          $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+          $$$$$$$$$$$$$$$$$$$$$$$$$$   $$$$$$$$$$$$$$$$$$$$$$$$    
+          $$$$$$$$$$$$$$$$$$$$$$$$       $$$$$$$$$$$$$$$$$$$$$     
+           $$$$$$$$$$$$$$$$$$$$           $$$$$$$$$$$$$$$$$      
+            $$$$$$$$$$$$$$$$                $$$$$$$$$$$$$       
+             $$$$$$$$$$$$$                   $$$$$$$$$$$        
+               $$$$$$$$$$$                      $$$$$$$$         
+                $$$$$$                        $$$$$          
+                   $$                                   `}
+          </pre>
+           <pre>
+{`          _____________          
+         /            /|         
+        /   MONEY   / |         
+       /___________/  |         
+       |           |  |         
+       |   $$$$$$  |  |         
+       |   $$$$$$  |  |         
+       |   $$$$$$  |  |         
+       |___________| /          
+        \\___________/            
+          $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+         $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+        $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+       $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$ 
+      $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$  
+     $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$   
+    $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$    
+   $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$     
+  $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$      
+ $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$        
+   $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$          
+      $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$             
+         $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$                
+            $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$                   
+                $$$$$$$$$$$$$$$$$$$$$$                      
+                    $$$$$$$$$$$$$$                         
+                       $$$$$$                              `}
+           </pre>
+        </div>
+        <div className="landing">
+          <div className="landing-content">
+            <h1>Welcome to <span>5th<span>Save</span></span></h1>
+            <p className="tagline">Smart savings, rewards, and community.</p>
+            <ul className="features">
+              <li>Set personalized savings goals</li>
+              <li>Earn exclusive vouchers & rewards</li>
+              <li>Join circles & compete with friends</li>
+            </ul>
           </div>
-        )}
-        <div className="auth-card">
-          <h1>5th<span>Save</span></h1>
-          <p className="muted">Goal-based savings, rewards and group tracking.</p>
-          {authError && <div className="auth-error">{authError}</div>}
-          <form onSubmit={handleAuth} className="auth-form">
-            {authMode === 'register' && (
-              <div className="field">
-                <label>Username</label>
-                <input className="input" placeholder="Your name" value={authForm.username} onChange={(e) => setAuthForm({ ...authForm, username: e.target.value })} />
+          <div className="auth-section">
+            {joinToken && (
+              <div className="auth-card invite-banner">
+                {inviteStatus === 'loading' && <p className="muted">Checking invite link…</p>}
+                {inviteStatus === 'ready' && invitePreview && (
+                  <>
+                    <h1 style={{ fontSize: 20 }}>{invitePreview.inviter ? `${invitePreview.inviter} invited you` : 'You were invited'} to join</h1>
+                    <p className="muted" style={{ marginBottom: 0 }}>“{invitePreview.circle_name}” · {invitePreview.member_count} member{invitePreview.member_count === 1 ? '' : 's'} — sign in below to accept.</p>
+                  </>
+                )}
+                {inviteStatus === 'invalid' && <div className="auth-error">This invite link is invalid or expired.</div>}
               </div>
             )}
-            <div className="field">
-              <label>Email</label>
-              <input className="input" placeholder="you@example.com" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })} />
+            <div className="auth-card">
+              <h2>{authMode === 'login' ? 'Sign In' : 'Create Account'}</h2>
+              {authError && <div className="auth-error">{authError}</div>}
+              <form onSubmit={handleAuth} className="auth-form">
+                {authMode === 'register' && (
+                  <div className="field">
+                    <label>Username</label>
+                    <input className="input" placeholder="Your name" value={authForm.username} onChange={(e) => setAuthForm({ ...authForm, username: e.target.value })} />
+                  </div>
+                )}
+                <div className="field">
+                  <label>Email</label>
+                  <input className="input" placeholder="you@example.com" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })} />
+                </div>
+                <div className="field">
+                  <label>Password</label>
+                  <input className="input" type="password" placeholder="••••••••" value={authForm.password} onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} />
+                </div>
+                <button type="submit" className="btn block">{authMode === 'login' ? 'Sign In' : 'Create Account'}</button>
+                <button type="button" className="link-btn" onClick={() => setAuthMode(authMode === 'login' ? 'register' : 'login')}>
+                  {authMode === 'login' ? 'New here? Register' : 'Already have an account? Sign In'}
+                </button>
+              </form>
             </div>
-            <div className="field">
-              <label>Password</label>
-              <input className="input" type="password" placeholder="••••••••" value={authForm.password} onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} />
-            </div>
-            <button type="submit" className="btn block">{authMode === 'login' ? 'Sign in' : 'Create account'}</button>
-            <button type="button" className="link-btn" onClick={() => setAuthMode(authMode === 'login' ? 'register' : 'login')}>
-              {authMode === 'login' ? 'New to 5thSave? Create an account' : 'Already have an account? Sign in'}
-            </button>
-          </form>
+          </div>
         </div>
       </div>
     );
@@ -593,6 +668,7 @@ function App() {
           <button className={`nav-btn ${currentPage === 'social' ? 'active' : ''}`} onClick={() => setCurrentPage('social')}>Circles</button>
         </nav>
         <div className="search-pill">⌕ &nbsp;Search goals, products, circles…</div>
+        <button className="btn secondary" onClick={toggleDark}>{darkMode ? 'Light' : 'Dark'} Mode</button>
         <div className="userbox">
           <div className="user-avatar">{initial}</div>
           <button className="logout-btn" onClick={() => { localStorage.removeItem('token'); setToken(null); setUser(null); }}>Log out</button>

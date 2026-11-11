@@ -1,0 +1,21 @@
+{
+  "name": "5thsave",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Goal-oriented savings and budget tracker",
+  "workspaces": [
+    "backend",
+    "frontend"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm run build --workspace frontend",
+    "start": "npm start --workspace backend",
+    "test": "npm test --workspace backend",
+    "test:deploy": "bash tests/deploy.sh",
+    "lint": "npm run lint --workspace frontend",
+    "db:init": "node scripts/init-db.js"
+  }
+}
