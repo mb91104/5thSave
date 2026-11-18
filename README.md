@@ -15,7 +15,7 @@
 - **Frontend**: React, Axios, Recharts (for budget visualization).
 - **Backend**: Node.js, Express.js.
 - **Database**: PostgreSQL.
-- **Authentication**: JWT (JSON Web Tokens) and bcryptjs for secure password hashing.
+- **Authentication**: JWT session stored in an `httpOnly`, `SameSite=Lax` cookie, with bcryptjs for password hashing (requests may also send `Authorization: Bearer <token>`).
 
 ## 📦 Getting Started
 
@@ -83,18 +83,43 @@ its `/api` prefix-stripping middleware.
    | `DATABASE_SSL` | no | Set `true` only for a self-signed provider certificate |
    | `PG_POOL_MAX` | no | Pool size per function instance (default 5) |
 5. **Deploy**, then check `https://<your-app>.vercel.app/api/health`. It should
-   return `{"status":"ok","database":"up"}`.
+   return `{"status":"ok","database":"up","config":{"jwtSecret":true,...}}`.
+   A broken deployment now explains itself: `missing` lists absent env vars and
+   `databaseError` carries the connection failure.
+
+> Environment variable changes only apply to **new** deployments. After editing
+> `JWT_SECRET` or `DATABASE_URL` in the dashboard, redeploy the project (Deployments
+> → ⋯ → Redeploy). The function no longer calls `process.exit()` when config is
+> missing, so `/api/health` reports the problem instead of returning Vercel's
+> opaque `FUNCTION_INVOCATION_FAILED`.
 
 ### Verify locally before deploying
 
 ```bash
-npm test             # API logic (40 checks)
+npm test             # API logic (46 checks)
 npm run test:deploy  # production build + Vercel-style /api routing + SPA fallback
+npm run test:live    # auth + a protected route against the deployed URL
 ```
 
 `test:deploy` builds the frontend, serves `frontend/dist` with the same SPA
 fallback as the Vercel frontend service, and routes `/api/*` through the actual
 Express backend service.
+
+`test:live` defaults to `https://5thsave.vercel.app`; pass another origin as the
+first argument (`npm run test:live -- https://preview.vercel.app`). It creates a
+throwaway user, so run it against a non-critical environment.
+
+### Authentication model
+
+- `POST /api/auth/register` and `/api/auth/login` sign a 24h JWT and set it in an
+  `httpOnly` cookie. The token is **not** returned to the browser, so no session
+  data lives in `localStorage`.
+- `GET /api/auth/me` rehydrates the session on page load.
+- `POST /api/auth/logout` clears the cookie.
+- Login/register are rate limited (30 attempts / 15 min per instance).
+- If a frontend is hosted on another origin, set `CORS_ORIGIN` (comma-separated)
+  so the API replies with `Access-Control-Allow-Credentials` and the cookie can
+  be sent cross-site.
 
 ### Notes
 

@@ -1,5 +1,7 @@
 const express = require('express');
 const cors = require('cors');
+const cookieParser = require('cookie-parser');
+const { rateLimit } = require('express-rate-limit');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
@@ -10,12 +12,39 @@ const db = require('./db');
 // accident invalidates every issued token.)
 require('dotenv').config({ path: path.join(__dirname, '.env'), quiet: true });
 
-if (!process.env.JWT_SECRET) {
-  console.error('FATAL: JWT_SECRET is not set. Define it in backend/.env (canonical) and restart.');
-  process.exit(1);
+// Never call process.exit() at import time. On Vercel that kills the function
+// before Express starts and every route returns an opaque
+// FUNCTION_INVOCATION_FAILED instead of a message we can act on. Report config
+// problems loudly, then let /health and the affected routes explain them.
+const missingConfig = () => {
+  const missing = [];
+  if (!process.env.JWT_SECRET) missing.push('JWT_SECRET');
+  if (!process.env.DATABASE_URL && !process.env.POSTGRES_URL) missing.push('DATABASE_URL');
+  return missing;
+};
+
+if (missingConfig().length) {
+  console.error(
+    `CONFIG ERROR: ${missingConfig().join(', ')} not set. ` +
+    'Auth/database routes will fail until these are defined in the environment ' +
+    '(on Vercel: Project → Settings → Environment Variables, then redeploy).'
+  );
+} else {
+  console.log(`5thSave backend loaded (node ${process.version}, config present).`);
 }
 
+// Surface crashes in the platform logs instead of losing them.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+});
+
 const app = express();
+// Vercel terminates TLS in front of the function; trust it so secure cookies
+// and protocol detection work.
+app.set('trust proxy', 1);
 
 // On Vercel the backend service receives the original /api/* path (see
 // vercel.json). Locally it runs at the root, so strip the prefix when present.
@@ -28,35 +57,109 @@ app.use((req, _res, next) => {
 
 // Same-origin deployments (the default on Vercel) do not need CORS. Set
 // CORS_ORIGIN to a comma-separated list when the frontend lives elsewhere.
+// credentials must be enabled for cookie-based sessions, and wildcard origins
+// are not allowed with credentials, so the list has to be explicit.
 const corsOrigins = (process.env.CORS_ORIGIN || '')
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean);
-app.use(cors(corsOrigins.length ? { origin: corsOrigins } : {}));
+app.use(cors(corsOrigins.length ? { origin: corsOrigins, credentials: true } : {}));
 app.use(express.json());
+app.use(cookieParser());
 
-// Deployment health check (uptime monitors / smoke tests).
+// Deployment health check (uptime monitors / smoke tests). Returns 503 with the
+// missing configuration keys so a broken deploy explains itself.
 app.get('/health', async (_req, res) => {
+  const missing = missingConfig();
+  let database = 'down';
+  let databaseError;
   try {
     await db.query('SELECT 1');
-    res.json({ status: 'ok', database: 'up', uptime: Math.round(process.uptime()) });
+    database = 'up';
   } catch (err) {
-    res.status(503).json({ status: 'error', database: 'down', error: err.message });
+    databaseError = err.message;
   }
+  const ok = missing.length === 0 && database === 'up';
+  res.status(ok ? 200 : 503).json({
+    status: ok ? 'ok' : 'error',
+    database,
+    config: {
+      jwtSecret: Boolean(process.env.JWT_SECRET),
+      databaseUrl: Boolean(process.env.DATABASE_URL || process.env.POSTGRES_URL),
+    },
+    ...(missing.length ? { missing } : {}),
+    ...(databaseError ? { databaseError } : {}),
+    uptime: Math.round(process.uptime()),
+  });
 });
 
-// Middleware to verify JWT
-const authenticateToken = (req, res, next) => {
+// --- Session helpers ---
+// The JWT lives in an httpOnly cookie so browser JavaScript (and any XSS that
+// reaches it) cannot read it. Requests from non-browser clients can still send
+// `Authorization: Bearer <token>`.
+const SESSION_COOKIE = 'fifthsave_session';
+const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+const sessionCookieOptions = () => ({
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'lax',
+  path: '/',
+});
+
+const setSessionCookie = (res, token) => {
+  res.cookie(SESSION_COOKIE, token, { ...sessionCookieOptions(), maxAge: SESSION_MAX_AGE_MS });
+};
+
+const clearSessionCookie = (res) => {
+  res.clearCookie(SESSION_COOKIE, sessionCookieOptions());
+};
+
+const signSessionToken = (user) => jwt.sign(
+  { id: user.id, username: user.username },
+  process.env.JWT_SECRET,
+  { expiresIn: '24h' }
+);
+
+const readSessionToken = (req) => {
   const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+  const bearer = authHeader && authHeader.split(' ')[1];
+  return req.cookies?.[SESSION_COOKIE] || bearer || null;
+};
+
+// Middleware to verify the session cookie (or a Bearer token for API clients)
+const authenticateToken = (req, res, next) => {
+  const token = readSessionToken(req);
 
   if (!token) return res.status(401).json({ error: 'Not signed in. Please sign in again.' });
+  if (!process.env.JWT_SECRET) {
+    return res.status(503).json({ error: 'Server is missing JWT_SECRET. Sign-in is unavailable until it is configured.' });
+  }
 
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
     if (err) return res.status(401).json({ error: 'Session expired. Please sign out and sign in again.' });
     req.user = user;
     next();
   });
+};
+
+// Login/register are the only unauthenticated write routes, so rate limit them.
+// On serverless this is per-instance (best effort), but it still stops runaway
+// credential stuffing from a single warm instance.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts. Wait a few minutes and try again.' },
+});
+
+const requireAuthConfig = (res) => {
+  if (process.env.JWT_SECRET) return true;
+  res.status(503).json({
+    error: 'Server is missing JWT_SECRET. Set it in the environment and redeploy.',
+  });
+  return false;
 };
 
 // --- Auth Routes ---
@@ -75,7 +178,8 @@ app.get('/auth/me', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/auth/register', async (req, res) => {
+app.post('/auth/register', authLimiter, async (req, res) => {
+  if (!requireAuthConfig(res)) return;
   const username = req.body.username?.trim();
   const email = normalizeEmail(req.body.email);
   const { password } = req.body;
@@ -94,16 +198,22 @@ app.post('/auth/register', async (req, res) => {
       'INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username',
       [username, email, hashedPassword]
     );
-    res.status(201).json(result.rows[0]);
+    const user = result.rows[0];
+    // Registering signs you in, so the user does not have to type the
+    // credentials again on the next screen.
+    setSessionCookie(res, signSessionToken(user));
+    res.status(201).json({ user });
   } catch (err) {
     if (err.code === '23505') {
       return res.status(409).json({ error: 'Username or email is already taken' });
     }
-    res.status(400).json({ error: err.message });
+    console.error('Register failed:', err);
+    res.status(400).json({ error: 'Could not create the account. Please try again.' });
   }
 });
 
-app.post('/auth/login', async (req, res) => {
+app.post('/auth/login', authLimiter, async (req, res) => {
+  if (!requireAuthConfig(res)) return;
   const email = normalizeEmail(req.body.email);
   const { password } = req.body;
   if (!email || !password) {
@@ -120,11 +230,17 @@ app.post('/auth/login', async (req, res) => {
     if (!match) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
-    const token = jwt.sign({ id: user.id, username: user.username }, process.env.JWT_SECRET, { expiresIn: '24h' });
-    res.json({ token, user: { id: user.id, username: user.username } });
+    setSessionCookie(res, signSessionToken(user));
+    res.json({ user: { id: user.id, username: user.username } });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Login failed:', err);
+    res.status(500).json({ error: 'Could not sign in right now. Please try again.' });
   }
+});
+
+app.post('/auth/logout', (_req, res) => {
+  clearSessionCookie(res);
+  res.json({ message: 'Signed out.' });
 });
 
 // --- Cart Routes ---
@@ -859,6 +975,14 @@ app.get('/circles/invite/:token', async (req, res) => {
 
 app.use((req, res) => {
   res.status(404).json({ error: `Not found: ${req.method} ${req.path}` });
+});
+
+// Central error handler: keep failures as JSON (never HTML or an empty 500) and
+// make sure the real stack reaches the platform logs.
+app.use((err, _req, res, _next) => {
+  console.error('Unhandled request error:', err);
+  if (res.headersSent) return res.end();
+  res.status(500).json({ error: 'Internal server error. Please try again.' });
 });
 
 const PORT = process.env.PORT || 3000;

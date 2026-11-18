@@ -1,14 +1,14 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import axios from 'axios';
+import api, { apiErrorMessage } from './api';
 import './App.css';
 import {
   PieChart, Pie, Cell, ResponsiveContainer,
   Tooltip, BarChart, Bar, XAxis, YAxis, CartesianGrid
 } from 'recharts';
 
-// /api works in development (Vite proxy) and on Vercel (serverless rewrite).
-// Set VITE_API_URL only for a split deployment on a different origin.
-const API_BASE = import.meta.env.VITE_API_URL || '/api';
+// /api works in development (Vite proxy) and on Vercel (service rewrite).
+// The HTTP-only session cookie is sent automatically; there is no token to keep
+// in localStorage.
 
 const MILESTONES = [
   { pct: 25, name: 'Flipkart Voucher' },
@@ -49,8 +49,11 @@ const WINDOWS = [
 ];
 
 function App() {
-  const [token, setToken] = useState(localStorage.getItem('token'));
+  // 'checking' until /auth/me answers, so a reload does not flash the sign-in
+  // screen before the httpOnly session cookie is verified.
+  const [session, setSession] = useState('checking'); // checking | in | out
   const [user, setUser] = useState(null);
+  const [authBusy, setAuthBusy] = useState(false);
   const [authMode, setAuthMode] = useState('login');
   const [authForm, setAuthForm] = useState({ email: '', password: '', username: '' });
   const [authError, setAuthError] = useState('');
@@ -80,59 +83,79 @@ function App() {
   const [toasts, setToasts] = useState([]);
 
   const toast = (msg) => {
+    // Never hand a non-string to React: an error object here used to white-screen
+    // the whole app with React error #31.
+    const text = typeof msg === 'string' ? msg : apiErrorMessage(msg, 'Something went wrong.');
     const id = Date.now() + Math.random();
-    setToasts((t) => [...t, { id, msg }]);
+    setToasts((t) => [...t, { id, msg: text }]);
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3200);
   };
 
-  const authHeaders = token ? { Authorization: `Bearer ${token}` } : {};
-
-  // Stale/expired token: drop it and send the user back to sign-in
-  // instead of failing every action silently.
-  // Login/register 401s (wrong password) must NOT clear the session —
-  // they are credential errors, not session errors.
+  // Expired/invalid session: send the user back to sign-in instead of failing
+  // every action silently. Login/register 401s are credential errors, not
+  // session errors, so they must not flip the session state.
   useEffect(() => {
-    const id = axios.interceptors.response.use(
+    const id = api.interceptors.response.use(
       (res) => res,
       (err) => {
         const url = err.config?.url || '';
-        const isAuthAttempt = url.includes('/auth/login') || url.includes('/auth/register');
-        if (err.response?.status === 401 && !isAuthAttempt && localStorage.getItem('token')) {
-          localStorage.removeItem('token');
-          setToken(null);
+        // Credential errors and the initial /auth/me probe are not session
+        // expiries; the probe's failure is expected for logged-out visitors.
+        const isAuthAttempt = url.includes('/auth/login')
+          || url.includes('/auth/register')
+          || url.includes('/auth/me');
+        if (err.response?.status === 401 && !isAuthAttempt) {
+          setSession('out');
           setUser(null);
-          toast('Session expired. Please sign in again.');
+          setAuthError('Your session expired. Please sign in again.');
         }
         return Promise.reject(err);
       }
     );
-    return () => axios.interceptors.response.eject(id);
+    return () => api.interceptors.response.eject(id);
+  }, []);
+
+  // Rehydrate the session from the httpOnly cookie on first load.
+  useEffect(() => {
+    let cancelled = false;
+    api.get('/auth/me')
+      .then((res) => {
+        if (cancelled) return;
+        setUser(res.data);
+        setSession('in');
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setUser(null);
+        setSession('out');
+      });
+    return () => { cancelled = true; };
   }, []);
 
   const fetchGoals = async () => {
     try {
-      const res = await axios.get(`${API_BASE}/goals`, { headers: authHeaders });
+      const res = await api.get(`/goals`);
       setGoals(res.data);
     } catch (err) { console.error(err); }
   };
   const fetchRewards = async () => {
     try {
-      const res = await axios.get(`${API_BASE}/rewards`, { headers: authHeaders });
+      const res = await api.get(`/rewards`);
       setRewards(res.data);
     } catch (err) { console.error(err); }
   };
   const fetchProducts = async (category = 'Food') => {
     try {
       const url = category && category !== 'All'
-        ? `${API_BASE}/products?category=${encodeURIComponent(category)}`
-        : `${API_BASE}/products`;
-      const res = await axios.get(url);
+        ? `/products?category=${encodeURIComponent(category)}`
+        : `/products`;
+      const res = await api.get(url);
       setProducts(res.data);
     } catch (err) { console.error(err); }
   };
   const fetchCategories = async () => {
     try {
-      const res = await axios.get(`${API_BASE}/products/categories`);
+      const res = await api.get(`/products/categories`);
       const map = {};
       res.data.forEach((r) => { map[r.category] = r.count; });
       setCategoryCounts(map);
@@ -144,41 +167,34 @@ function App() {
   };
   const fetchCircles = async () => {
     try {
-      const res = await axios.get(`${API_BASE}/circles`, { headers: authHeaders });
+      const res = await api.get(`/circles`);
       setCircles(res.data);
     } catch (err) { console.error(err); }
   };
   const fetchCart = async () => {
     try {
-      const res = await axios.get(`${API_BASE}/cart`, { headers: authHeaders });
+      const res = await api.get(`/cart`);
       setCart(res.data);
     } catch (err) { console.error(err); }
   };
   const fetchOrders = async () => {
     try {
-      const res = await axios.get(`${API_BASE}/orders`, { headers: authHeaders });
+      const res = await api.get(`/orders`);
       setOrders(res.data);
     } catch (err) { console.error(err); }
   };
 
   useEffect(() => {
-    if (token) {
-      // Rehydrate the user after a page reload (token persists, state doesn't).
-      if (!user) {
-        axios.get(`${API_BASE}/auth/me`, { headers: authHeaders })
-          .then((res) => setUser(res.data))
-          .catch(() => { /* interceptor handles expired tokens */ });
-      }
-      fetchGoals();
-      fetchRewards();
-      fetchProducts();
-      fetchCategories();
-      fetchCircles();
-      fetchCart();
-      fetchOrders();
-    }
+    if (session !== 'in') return;
+    fetchGoals();
+    fetchRewards();
+    fetchProducts();
+    fetchCategories();
+    fetchCircles();
+    fetchCart();
+    fetchOrders();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token]);
+  }, [session]);
 
   const stats = useMemo(() => {
     const totalLimit = goals.reduce((s, g) => s + (Number(g.amount_limit) || 0), 0);
@@ -249,55 +265,70 @@ function App() {
   const handleAuth = async (e) => {
     e.preventDefault();
     setAuthError('');
+    setAuthBusy(true);
     const endpoint = authMode === 'login' ? '/auth/login' : '/auth/register';
     try {
-      const res = await axios.post(`${API_BASE}${endpoint}`, authForm);
-      if (authMode === 'login') {
-        setToken(res.data.token);
-        localStorage.setItem('token', res.data.token);
-        setUser(res.data.user);
-      } else {
-        toast('Account created. Please sign in.');
-        setAuthMode('login');
-      }
+      // The backend sets an httpOnly session cookie; there is no token to store.
+      const res = await api.post(endpoint, authForm);
+      setUser(res.data.user);
+      setSession('in');
+      setAuthForm({ email: '', password: '', username: '' });
+      toast(authMode === 'login' ? `Welcome back, ${res.data.user.username}.` : 'Account created — you are signed in.');
     } catch (err) {
-      if (!err.response) {
-        setAuthError(`Cannot reach the server at ${API_BASE}. Is the backend running? (cd backend && npm start)`);
-      } else {
-        setAuthError(err.response.data?.error || 'Authentication failed');
-      }
+      setAuthError(apiErrorMessage(err, 'Authentication failed'));
+    } finally {
+      setAuthBusy(false);
     }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await api.post('/auth/logout');
+    } catch {
+      // The cookie may already be gone; clear local state regardless.
+    }
+    setUser(null);
+    setSession('out');
+    setAuthError('');
+    setAuthMode('login');
+    setGoals([]);
+    setRewards([]);
+    setCircles([]);
+    setLeaderboard([]);
+    setCart([]);
+    setOrders([]);
+    setCurrentPage('dashboard');
   };
 
   const resetGoals = async () => {
     if (!window.confirm('Delete all goals? This cannot be undone.')) return;
     try {
-      await axios.delete(`${API_BASE}/goals`, { headers: authHeaders });
+      await api.delete(`/goals`);
       fetchGoals();
       fetchRewards();
       fetchOrders();
       toast('All goals deleted.');
-    } catch (err) { toast(err.response?.data?.error || 'Failed to reset goals'); }
+    } catch (err) { toast(apiErrorMessage(err, 'Failed to reset goals')); }
   };
 
   const deleteGoal = async (goalId) => {
     if (!window.confirm(`Delete goal #${goalId}? Its spending and rewards go too.`)) return;
     try {
-      await axios.delete(`${API_BASE}/goals/${goalId}`, { headers: authHeaders });
+      await api.delete(`/goals/${goalId}`);
       fetchGoals();
       fetchRewards();
       fetchOrders();
       toast('Goal deleted.');
-    } catch (err) { toast(err.response?.data?.error || 'Could not delete goal'); }
+    } catch (err) { toast(apiErrorMessage(err, 'Could not delete goal')); }
   };
 
   const resetGoalRewards = async (goalId) => {
     if (!window.confirm(`Clear all rewards for goal #${goalId}? The goal itself stays.`)) return;
     try {
-      const res = await axios.delete(`${API_BASE}/goals/${goalId}/rewards`, { headers: authHeaders });
+      const res = await api.delete(`/goals/${goalId}/rewards`);
       fetchRewards();
       toast(res.data.message || 'Rewards cleared.');
-    } catch (err) { toast(err.response?.data?.error || 'Could not clear rewards'); }
+    } catch (err) { toast(apiErrorMessage(err, 'Could not clear rewards')); }
   };
 
   const windowDays = goalWindow === 'month' ? 30 : 7;
@@ -306,20 +337,20 @@ function App() {
   const createGoal = async (e) => {
     e.preventDefault();
     try {
-      await axios.post(`${API_BASE}/goals`, {
+      await api.post(`/goals`, {
         amount_limit: goalForm.amount_limit,
         start_date: goalForm.start_date || todayStr(),
         end_date: goalEndPreview,
-      }, { headers: authHeaders });
+      });
       setGoalForm({ amount_limit: '', start_date: todayStr() });
       fetchGoals();
       toast(`Goal saved · you have ${windowDays} days.`);
-    } catch (err) { toast(err.response?.data?.error || 'Failed to create goal'); }
+    } catch (err) { toast(apiErrorMessage(err, 'Failed to create goal')); }
   };
 
   const endGoal = async (goalId) => {
     try {
-      const res = await axios.post(`${API_BASE}/goals/${goalId}/end`, {}, { headers: authHeaders });
+      const res = await api.post(`/goals/${goalId}/end`, {});
       const earned = res.data.rewards || [];
       const score = res.data.saver_score;
       if (earned.length) {
@@ -329,22 +360,22 @@ function App() {
       }
       fetchGoals();
       fetchRewards();
-    } catch (err) { toast(err.response?.data?.error || 'Failed to end goal'); }
+    } catch (err) { toast(apiErrorMessage(err, 'Failed to end goal')); }
   };
 
   const addToCart = async (productId) => {
     try {
-      await axios.post(`${API_BASE}/cart`, { productId, quantity: 1 }, { headers: authHeaders });
+      await api.post(`/cart`, { productId, quantity: 1 });
       fetchCart();
       toast('Added to cart.');
-    } catch (err) { toast(err.response?.data?.error || 'Failed to add item'); }
+    } catch (err) { toast(apiErrorMessage(err, 'Failed to add item')); }
   };
 
   const removeFromCart = async (itemId) => {
     try {
-      await axios.delete(`${API_BASE}/cart/${itemId}`, { headers: authHeaders });
+      await api.delete(`/cart/${itemId}`);
       fetchCart();
-    } catch (err) { toast(err.response?.data?.error || 'Failed to remove item'); }
+    } catch (err) { toast(apiErrorMessage(err, 'Failed to remove item')); }
   };
 
   const [spotlight, setSpotlight] = useState(null);
@@ -358,7 +389,7 @@ function App() {
     const limit = Number(goalBefore?.amount_limit) || 0;
     const spentBefore = Number(goalBefore?.total_spent) || 0;
     try {
-      const res = await axios.post(`${API_BASE}/shop/checkout`, { goalId: gid }, { headers: authHeaders });
+      const res = await api.post(`/shop/checkout`, { goalId: gid });
       const deducted = Number(res.data.totalAmount) || 0;
       const spentAfter = spentBefore + deducted;
       const pctAfter = limit > 0 ? (spentAfter / limit) * 100 : 0;
@@ -389,7 +420,7 @@ function App() {
       } else {
         toast(`Bought! You saved ${saverAfter.toFixed(0)}%. +1 day passed.`);
       }
-    } catch (err) { toast(err.response?.data?.error || 'Checkout failed'); }
+    } catch (err) { toast(apiErrorMessage(err, 'Checkout failed')); }
   };
 
   const closeReceipt = () => {
@@ -399,7 +430,7 @@ function App() {
 
   const skipTime = async (goal, interval, days) => {
     try {
-      const res = await axios.post(`${API_BASE}/goals/${goal.id}/skip-time`, { interval }, { headers: authHeaders });
+      const res = await api.post(`/goals/${goal.id}/skip-time`, { interval });
       if (res.data.expired) {
         const rw = res.data.rewards || [];
         toast(rw.length
@@ -410,25 +441,25 @@ function App() {
       }
       fetchGoals();
       fetchRewards();
-    } catch (err) { toast(err.response?.data?.error || 'Could not move time. Try again.'); }
+    } catch (err) { toast(apiErrorMessage(err, 'Could not move time. Try again.')); }
   };
 
   const createCircle = async (e) => {
     e.preventDefault();
     if (!circleForm.circle_name.trim()) return toast('Enter a circle name.');
     try {
-      await axios.post(`${API_BASE}/circles`, { circle_name: circleForm.circle_name }, { headers: authHeaders });
+      await api.post(`/circles`, { circle_name: circleForm.circle_name });
       fetchCircles();
       setCircleForm({ circle_name: '' });
       toast('Circle created.');
-    } catch (err) { toast(err.response?.data?.error || 'Failed to create circle'); }
+    } catch (err) { toast(apiErrorMessage(err, 'Failed to create circle')); }
   };
 
   const fetchInvitePreview = async (tok) => {
     if (!tok) return;
     setInviteStatus('loading');
     try {
-      const res = await axios.get(`${API_BASE}/circles/invite/${tok}`);
+      const res = await api.get(`/circles/invite/${tok}`);
       setInvitePreview(res.data);
       setInviteStatus('ready');
     } catch {
@@ -453,21 +484,21 @@ function App() {
     if (!joinToken) return;
     setJoining(true);
     try {
-      const res = await axios.post(`${API_BASE}/circles/join-invite`, { token: joinToken }, { headers: authHeaders });
+      const res = await api.post(`/circles/join-invite`, { token: joinToken });
       toast(res.data.message || 'Joined circle.');
       const cid = res.data.circle_id;
       exitJoinView();
       await fetchCircles();
       setCurrentPage('social');
       if (cid) fetchLeaderboard(cid);
-    } catch (err) { toast(err.response?.data?.error || 'Failed to join circle'); }
+    } catch (err) { toast(apiErrorMessage(err, 'Failed to join circle')); }
     setJoining(false);
   };
 
   const [shareMenu, setShareMenu] = useState(null); // { circle, link } or null
 
   const getInviteLink = async (circle) => {
-    const res = await axios.post(`${API_BASE}/circles/invite`, { circle_id: circle.id }, { headers: authHeaders });
+    const res = await api.post(`/circles/invite`, { circle_id: circle.id });
     return `${window.location.origin}/join/${res.data.invite_token}`;
   };
 
@@ -475,7 +506,7 @@ function App() {
     try {
       const link = await getInviteLink(circle);
       setShareMenu({ circle, link });
-    } catch (err) { toast(err.response?.data?.error || 'Failed to create invite link'); }
+    } catch (err) { toast(apiErrorMessage(err, 'Failed to create invite link')); }
   };
 
   const shareMessage = () => {
@@ -517,27 +548,27 @@ function App() {
   const leaveCircle = async (circle) => {
     if (!window.confirm(`Leave "${circle.circle_name || `Circle #${circle.id}`}"?`)) return;
     try {
-      const res = await axios.delete(`${API_BASE}/circles/${circle.id}/leave`, { headers: authHeaders });
+      const res = await api.delete(`/circles/${circle.id}/leave`);
       toast(res.data.message || 'Left circle.');
       if (activeBoard === circle.id) { setActiveBoard(null); setLeaderboard([]); }
       fetchCircles();
-    } catch (err) { toast(err.response?.data?.error || 'Failed to leave circle'); }
+    } catch (err) { toast(apiErrorMessage(err, 'Failed to leave circle')); }
   };
 
   const deleteCircle = async (circle) => {
     if (!window.confirm(`Delete "${circle.circle_name || `Circle #${circle.id}`}" for all ${circle.member_count ?? ''} members? This cannot be undone.`)) return;
     try {
-      await axios.delete(`${API_BASE}/circles/${circle.id}`, { headers: authHeaders });
+      await api.delete(`/circles/${circle.id}`);
       toast('Circle deleted.');
       if (activeBoard === circle.id) { setActiveBoard(null); setLeaderboard([]); }
       fetchCircles();
-    } catch (err) { toast(err.response?.data?.error || 'Failed to delete circle'); }
+    } catch (err) { toast(apiErrorMessage(err, 'Failed to delete circle')); }
   };
 
   const fetchLeaderboard = async (circleId) => {
     try {
       setActiveBoard(circleId);
-      const res = await axios.get(`${API_BASE}/leaderboard/${circleId}`, { headers: authHeaders });
+      const res = await api.get(`/leaderboard/${circleId}`);
       setLeaderboard(res.data);
     } catch (err) { console.error(err); }
   };
@@ -553,7 +584,17 @@ function App() {
   };
   const themeClass = `${darkMode ? 'theme-dark' : ''} ${currentPage === 'dashboard' ? 'theme-dashboard' : currentPage === 'shop' ? 'theme-shop' : currentPage === 'report' ? 'theme-report' : 'theme-social'}`.trim();
 
-  if (!token) {
+  if (session === 'checking') {
+    return (
+      <div className="landing-wrapper">
+        <div className="landing">
+          <p className="muted">Checking your session…</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (session !== 'in') {
     return (
       <div className="landing-wrapper">
         <div className="ascii-bg">
@@ -623,7 +664,7 @@ function App() {
             )}
             <div className="auth-card">
               <h2>{authMode === 'login' ? 'Sign In' : 'Create Account'}</h2>
-              {authError && <div className="auth-error">{authError}</div>}
+              {authError && <div className="auth-error">{String(authError)}</div>}
               <form onSubmit={handleAuth} className="auth-form">
                 {authMode === 'register' && (
                   <div className="field">
@@ -639,8 +680,10 @@ function App() {
                   <label>Password</label>
                   <input className="input" type="password" placeholder="••••••••" value={authForm.password} onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} />
                 </div>
-                <button type="submit" className="btn block">{authMode === 'login' ? 'Sign In' : 'Create Account'}</button>
-                <button type="button" className="link-btn" onClick={() => setAuthMode(authMode === 'login' ? 'register' : 'login')}>
+                <button type="submit" className="btn block" disabled={authBusy}>
+                  {authBusy ? 'Please wait…' : authMode === 'login' ? 'Sign In' : 'Create Account'}
+                </button>
+                <button type="button" className="link-btn" onClick={() => { setAuthError(''); setAuthMode(authMode === 'login' ? 'register' : 'login'); }}>
                   {authMode === 'login' ? 'New here? Register' : 'Already have an account? Sign In'}
                 </button>
               </form>
@@ -671,7 +714,7 @@ function App() {
         <button className="btn secondary" onClick={toggleDark}>{darkMode ? 'Light' : 'Dark'} Mode</button>
         <div className="userbox">
           <div className="user-avatar">{initial}</div>
-          <button className="logout-btn" onClick={() => { localStorage.removeItem('token'); setToken(null); setUser(null); }}>Log out</button>
+          <button className="logout-btn" onClick={handleLogout}>Log out</button>
         </div>
       </header>
 
@@ -1257,7 +1300,7 @@ function App() {
       )}
 
       <div className="toasts">
-        {toasts.map((t) => <div key={t.id} className="toast">{t.msg}</div>)}
+        {toasts.map((t) => <div key={t.id} className="toast">{String(t.msg)}</div>)}
       </div>
     </div>
   );

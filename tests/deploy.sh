@@ -49,6 +49,7 @@ curl -s -m 2 "$BASE/api/health" >/dev/null 2>&1 || {
 
 chk "health" '"status":"ok"' "$(curl -s "$BASE/api/health")"
 chk "health-db" '"database":"up"' "$(curl -s "$BASE/api/health")"
+chk "health-config" '"jwtSecret":true' "$(curl -s "$BASE/api/health")"
 chk "spa-root" '<div id="root">' "$(curl -s "$BASE/")"
 chk "spa-invite-route" '<div id="root">' "$(curl -s "$BASE/join/abc123")"
 ASSET=$(ls frontend/dist/assets | grep '\.js$' | head -1)
@@ -59,17 +60,21 @@ chk "noauth-401" 'Not signed in' "$(curl -s "$BASE/api/goals")"
 chk "notfound-json" 'Not found' "$(curl -s "$BASE/api/does-not-exist")"
 
 E="$TAG@test.com"
-chk "register" '"id"' "$(curl -s -X POST "$BASE/api/auth/register" -H 'Content-Type: application/json' -d "{\"username\":\"$TAG\",\"email\":\"$E\",\"password\":\"secret123\"}")"
-T=$(curl -s -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' -d "{\"email\":\"$E\",\"password\":\"secret123\"}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))")
-chk "login-token" '.' "$T"
-A="Authorization: Bearer $T"
-chk "auth/me" "$E" "$(curl -s "$BASE/api/auth/me" -H "$A")"
-G=$(curl -s -X POST "$BASE/api/goals" -H "$A" -H 'Content-Type: application/json' -d '{"amount_limit":1000,"start_date":"2026-10-01","end_date":"2026-10-08"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+JAR=$(mktemp)
+REG_HEADERS=$(mktemp)
+chk "register" '"username"' "$(curl -s -D "$REG_HEADERS" -c "$JAR" -X POST "$BASE/api/auth/register" -H 'Content-Type: application/json' -d "{\"username\":\"$TAG\",\"email\":\"$E\",\"password\":\"secret123\"}")"
+chk "register-sets-cookie" 'fifthsave_session' "$(grep -i '^set-cookie' "$REG_HEADERS")"
+chk "login" '"username"' "$(curl -s -c "$JAR" -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' -d "{\"email\":\"$E\",\"password\":\"secret123\"}")"
+chk "auth/me" "$E" "$(curl -s "$BASE/api/auth/me" -b "$JAR")"
+G=$(curl -s -X POST "$BASE/api/goals" -b "$JAR" -H 'Content-Type: application/json' -d '{"amount_limit":1000,"start_date":"2026-10-01","end_date":"2026-10-08"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 chk "create-goal" '.' "$G"
 PID=$(curl -s "$BASE/api/products" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
-chk "cart" '"quantity"' "$(curl -s -X POST "$BASE/api/cart" -H "$A" -H 'Content-Type: application/json' -d "{\"productId\":$PID,\"quantity\":1}")"
-chk "checkout" 'Checkout successful' "$(curl -s -X POST "$BASE/api/shop/checkout" -H "$A" -H 'Content-Type: application/json' -d "{\"goalId\":$G}")"
-chk "delete-goal" 'deleted' "$(curl -s -X DELETE "$BASE/api/goals/$G" -H "$A")"
+chk "cart" '"quantity"' "$(curl -s -X POST "$BASE/api/cart" -b "$JAR" -H 'Content-Type: application/json' -d "{\"productId\":$PID,\"quantity\":1}")"
+chk "checkout" 'Checkout successful' "$(curl -s -X POST "$BASE/api/shop/checkout" -b "$JAR" -H 'Content-Type: application/json' -d "{\"goalId\":$G}")"
+chk "delete-goal" 'deleted' "$(curl -s -X DELETE "$BASE/api/goals/$G" -b "$JAR")"
+chk "logout" 'Signed out' "$(curl -s -b "$JAR" -c "$JAR" -X POST "$BASE/api/auth/logout")"
+chk "after-logout-401" 'Not signed in' "$(curl -s "$BASE/api/auth/me" -b "$JAR")"
+rm -f "$JAR" "$REG_HEADERS"
 
 echo "--- PASS=$PASS FAIL=$FAIL ---"
 [ "$FAIL" -eq 0 ]

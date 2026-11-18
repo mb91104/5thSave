@@ -15,6 +15,7 @@
     "start": "npm start --workspace backend",
     "test": "npm test --workspace backend",
     "test:deploy": "bash tests/deploy.sh",
+    "test:live": "bash tests/live-smoke.sh",
     "lint": "npm run lint --workspace frontend",
     "db:init": "node scripts/init-db.js"
   }
